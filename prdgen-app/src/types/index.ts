@@ -34,7 +34,13 @@ export interface PRDContent {
 
 export type PRDSectionKey = keyof PRDContent;
 
-export const PRD_SECTIONS: { key: PRDSectionKey; title: string }[] = [
+/** A section descriptor: its stable key and the human title used as heading. */
+export interface PRDSection {
+  key: PRDSectionKey;
+  title: string;
+}
+
+export const PRD_SECTIONS: PRDSection[] = [
   { key: 'executive_summary', title: 'Executive Summary' },
   { key: 'problem_statement', title: 'Problem Statement' },
   { key: 'goals_metrics', title: 'Goals & Success Metrics' },

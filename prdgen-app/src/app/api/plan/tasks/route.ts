@@ -2,16 +2,14 @@ import {
   buildTaskSystemPrompt,
   buildTaskUserPrompt,
   extractJson,
+  looksLikeNonJsonAnswer,
 } from '@/lib/ai/plan-prompts';
 import { planCandidates, runPlanStream, sse, type PlanRequestBody } from '@/lib/ai/plan-stream';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
+import { parseBody, planTasksRequestSchema } from '@/lib/validation/schemas';
 import type { PlanStructure, PlanTask } from '@/types';
 
 export const dynamic = 'force-dynamic';
-
-interface TaskRequest extends PlanRequestBody {
-  structure?: PlanStructure;
-}
 
 interface TaskResult {
   features: { id: string; tasks: PlanTask[] }[];
@@ -23,8 +21,11 @@ export async function POST(req: Request) {
   const user = await getAuthUser();
   if (!user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
+  const parsed = await parseBody(req, planTasksRequestSchema);
+  if (!parsed.ok) return parsed.response;
+
   const encoder = new TextEncoder();
-  const body = (await req.json().catch(() => ({}))) as TaskRequest;
+  const body = parsed.data as PlanRequestBody & { structure?: PlanStructure };
   const structure = body.structure;
 
   const resolved = await planCandidates(user.id, body);
@@ -62,8 +63,16 @@ export async function POST(req: Request) {
 
         const parsed = extractJson<TaskResult>(accText);
         if (!parsed || !Array.isArray(parsed.features)) {
+          const refused = looksLikeNonJsonAnswer(accText);
           controller.enqueue(
-            encoder.encode(sse({ type: 'error', message: 'Model tidak mengembalikan task JSON yang valid.' }))
+            encoder.encode(
+              sse({
+                type: 'error',
+                message: refused
+                  ? 'Model menjawab dengan teks/tool-call, bukan JSON. Pakai model instruct (bukan alias combo/router) — set NINE_ROUTER_STRUCTURED_MODEL.'
+                  : 'Model tidak mengembalikan task JSON yang valid.',
+              })
+            )
           );
           return;
         }

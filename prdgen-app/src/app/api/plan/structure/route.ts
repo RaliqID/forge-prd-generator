@@ -2,17 +2,16 @@ import {
   buildStructureSystemPrompt,
   buildStructureUserPrompt,
   extractJson,
+  looksLikeNonJsonAnswer,
 } from '@/lib/ai/plan-prompts';
 import { planCandidates, runPlanStream, sse, type PlanRequestBody } from '@/lib/ai/plan-stream';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
+import { parseBody, planStructureRequestSchema } from '@/lib/validation/schemas';
+import { requestLogger } from '@/lib/logger';
 import type { PlanStructure } from '@/types';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
-
-interface StructureRequest extends PlanRequestBody {
-  idea?: string;
-}
 
 const THINKING_THROTTLE_MS = 1500;
 
@@ -20,8 +19,12 @@ export async function POST(req: Request) {
   const user = await getAuthUser();
   if (!user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
+  const parsed = await parseBody(req, planStructureRequestSchema);
+  if (!parsed.ok) return parsed.response;
+
   const encoder = new TextEncoder();
-  const body = (await req.json().catch(() => ({}))) as StructureRequest;
+  const log = requestLogger(req, '/api/plan/structure');
+  const body = parsed.data as PlanRequestBody & { idea?: string };
   const idea = (body.idea ?? '').trim();
 
   const resolved = await planCandidates(user.id, body);
@@ -64,8 +67,19 @@ export async function POST(req: Request) {
 
         const structure = extractJson<PlanStructure>(accText);
         if (!structure || !Array.isArray(structure.features)) {
+          // Distinguish "the model refused the JSON contract" from "the JSON
+          // was malformed" — the fix is different (change model vs retry), so
+          // the message must say which happened.
+          const refused = looksLikeNonJsonAnswer(accText);
           controller.enqueue(
-            encoder.encode(sse({ type: 'error', message: 'Model tidak mengembalikan struktur JSON yang valid.' }))
+            encoder.encode(
+              sse({
+                type: 'error',
+                message: refused
+                  ? 'Model menjawab dengan teks/tool-call, bukan JSON. Pakai model instruct (bukan alias combo/router) — set NINE_ROUTER_STRUCTURED_MODEL.'
+                  : 'Model tidak mengembalikan struktur JSON yang valid.',
+              })
+            )
           );
           return;
         }
@@ -95,11 +109,18 @@ export async function POST(req: Request) {
 
         controller.enqueue(encoder.encode(sse({ type: 'structure', structure })));
         controller.enqueue(encoder.encode(sse({ type: 'done' })));
+        log.info('structure complete', {
+          elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+          features: structure.features.length,
+          provider: candidates[0]?.provider.id ?? null,
+          model: candidates[0]?.modelString ?? null,
+        });
       } catch (err) {
-        // Log server-side: Vercel function logs were empty because nothing was
-        // ever written, making silent-stream failures impossible to diagnose.
+        // A silent-stream failure used to leave the logs empty, which made it
+        // impossible to diagnose. `tokensReceived` distinguishes "provider
+        // returned nothing" from "provider returned something unparseable".
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
-        console.error(`[plan/structure] failed after ${elapsed}s (tokens received: ${sawToken}):`, err);
+        log.error('structure failed', { elapsedSec: elapsed, tokensReceived: sawToken, err });
         controller.enqueue(
           encoder.encode(sse({ type: 'error', message: err instanceof Error ? err.message : 'Unknown error' }))
         );

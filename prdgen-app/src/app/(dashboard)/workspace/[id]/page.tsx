@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useSearchParams, useRouter } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
   ArrowLeft,
@@ -98,7 +98,6 @@ const SKELETON_STRUCTURE: PlanStructure = {
 export default function WorkspacePage() {
   const params = useParams();
   const searchParams = useSearchParams();
-  const router = useRouter();
   const workspaceId = params.id as string;
   const shouldGenerate = searchParams.get('generate') === 'true';
   const modelParam = searchParams.get('model') ?? '9router-auto';
@@ -341,6 +340,9 @@ export default function WorkspacePage() {
       let received: PlanStructure | null = null;
       // Slow models sometimes die before emitting the structure event. Retry
       // once immediately; the existing !received guard reports final failure.
+      // The LAST error is kept so the final message explains WHY it failed
+      // instead of a generic "struktur tidak valid".
+      let lastStructureError: Error | null = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           const res = await fetch('/api/plan/structure', {
@@ -348,7 +350,11 @@ export default function WorkspacePage() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ model_id: activeModel, idea: ideaText, ...(engineRef ?? {}) }),
           });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) {
+            // A real HTTP error carries a JSON body explaining the cause.
+            const detail = await res.json().catch(() => null) as { error?: string } | null;
+            throw new Error(detail?.error || `HTTP ${res.status}`);
+          }
 
           for await (const raw of parseSSEStream(res as Response) as AsyncGenerator<StreamEvent>) {
             const ev = raw as unknown as PlanEvent;
@@ -362,9 +368,10 @@ export default function WorkspacePage() {
               throw new Error(ev.message ?? 'Gagal membuat struktur');
             }
           }
-        } catch {
-          // Attempt failed (timeout/stream error) — try once more if we haven't
-          // received a structure yet.
+        } catch (err) {
+          // Attempt failed (timeout/stream error) — remember why, then retry
+          // once if we still have no structure.
+          lastStructureError = err instanceof Error ? err : new Error(String(err));
         }
         if (received) break;
       }
@@ -373,7 +380,10 @@ export default function WorkspacePage() {
       // structure (e.g. an unknown model returns empty/invalid JSON). Don't
       // mark the step complete in that case — surface it as an error instead.
       if (!received || !Array.isArray(received.features) || received.features.length === 0) {
-        throw new Error('Model tidak mengembalikan struktur yang valid. Coba model lain.');
+        throw new Error(
+          lastStructureError?.message ||
+            'Model tidak mengembalikan struktur yang valid. Coba model lain.'
+        );
       }
 
       markComplete('structure');

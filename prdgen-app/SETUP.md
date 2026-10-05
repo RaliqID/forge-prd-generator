@@ -72,7 +72,7 @@ App jalan lokal **tanpa Supabase** via dev login (auth dev-mode). Tapi fitur aut
 ## 5. Jalankan
 
 ```bash
-npm run dev          # http://localhost:3000
+npm run dev          # http://localhost:5555
 ```
 
 ## Deployment

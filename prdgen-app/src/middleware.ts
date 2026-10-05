@@ -18,6 +18,9 @@ export async function middleware(request: NextRequest) {
     pathname.startsWith('/blog') ||
     pathname.startsWith('/share/') ||
     pathname.startsWith('/auth/callback') ||
+    // Health/readiness probes must answer without a session — an orchestrator
+    // has no cookie, and a 302 to /login reads as "unhealthy".
+    pathname === '/api/health' ||
     pathname.startsWith('/api/auth/');
 
   const isAuthPage = pathname === '/login';

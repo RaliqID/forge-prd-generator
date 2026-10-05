@@ -3,6 +3,7 @@ import {
   openProviderStream,
   parseTokenStream,
   parseAnthropicStream,
+  resolveStructuredModel,
 } from '@/lib/ai/providers';
 import type { StreamChunk } from '@/lib/ai/providers';
 import { buildEngineCandidates, type EngineRequestBody, type EngineCandidatesResult } from '@/lib/ai/engine-candidates';
@@ -25,7 +26,22 @@ export async function planCandidates(
 ): Promise<EngineCandidatesResult> {
   const modelId = body.model_id ?? '';
   if (!modelId) return { ok: true, candidates: [] };
-  return buildEngineCandidates(userId, body);
+
+  const resolved = await buildEngineCandidates(userId, body);
+  if (!resolved.ok) return resolved;
+
+  // The Struktur/Task phases emit a strict JSON document. A combo/auto alias
+  // (e.g. 9Router's `Dev-Stack`) round-robins to coding-agent upstreams that
+  // answer with tool calls or prose instead of JSON, which produced an empty
+  // feature map and a retry storm. Point the built-in 9Router candidate at an
+  // explicit instruct model for these phases; a user-supplied custom engine is
+  // left exactly as configured.
+  return {
+    ok: true,
+    candidates: resolved.candidates.map((c) =>
+      c.provider.id === '9router' ? { ...c, modelString: resolveStructuredModel() } : c
+    ),
+  };
 }
 
 type Candidate = ReturnType<typeof buildProviderCandidates>[number];
@@ -83,6 +99,14 @@ export async function runPlanStream(params: {
           { role: 'user', content: user },
         ],
         signal: attempt.signal,
+        // These phases want a JSON document, not deliberation. Reasoning costs
+        // latency and, on reasoning-heavy routes, ends with the budget spent
+        // and a prose/tool-call answer instead of the object. Measured ~6s and
+        // valid JSON with reasoning off.
+        reasoning: 'off',
+        // A structure/task payload is small; a big cap only invites the model
+        // to keep talking. 6k comfortably fits 8-10 features with sub-features.
+        maxTokens: 6000,
       });
       touch();
 

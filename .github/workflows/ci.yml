@@ -1,0 +1,62 @@
+name: CI
+
+# Typecheck, lint, unit-test and build on every push and PR. The build step is
+# what catches route/import errors that typecheck alone misses; the test step
+# guards the logic that has already broken in production once (heading
+# matching, JSON extraction, payload validation).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A newer push on the same ref cancels the older run — saves minutes on rapid
+# iteration without ever cancelling a run for a different ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20.x, 22.x]
+
+    defaults:
+      run:
+        working-directory: prdgen-app
+
+    env:
+      # Prisma reads DATABASE_URL at generate-time; a placeholder is enough
+      # because no migration or query runs in CI.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/forge
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/forge
+      # Dev-session signing needs a secret; any value works for build/test.
+      ENGINE_ENC_SECRET: ci-only-not-a-real-secret-0000000000000000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: prdgen-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build

@@ -22,14 +22,50 @@ export interface AIProvider {
   resolveModel?: (modelId: string) => string;
 }
 
+/**
+ * Normalize a configured base URL before path appending.
+ *
+ * Every caller builds `${baseUrl}/chat/completions` (or `/v1/messages`), so a
+ * trailing slash yields a double slash. Next.js-style proxies (which 9Router is)
+ * answer that with a 308 redirect — and a 308 on a POST whose body some runtimes
+ * fail to replay turns into an opaque "no response" mid-generation. Trimming
+ * here keeps a hand-typed `.../v1/` working.
+ */
+function normalizeBaseUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, '');
+}
+
 // ── Provider definitions ──
+
+/**
+ * Model used for STRUCTURED (JSON) phases — the Struktur and Task steps.
+ *
+ * These phases need a model that obeys a strict output contract, and the
+ * general-purpose default often doesn't. On 9Router the `Dev-Stack` combo
+ * round-robins its upstreams, and the coding-agent-tuned ones answer a
+ * "produce JSON" prompt by trying to EXECUTE a shell command (emitting
+ * DeepSeek tool-call markup) or by writing prose — never the JSON object. The
+ * result was an empty feature map and a client-side retry storm (~170s wasted).
+ *
+ * A model named directly (bypassing the combo) answers the same prompt with
+ * valid JSON in ~6s. Overridable so a different deployment can point this at
+ * whatever reliable instruct model it has.
+ */
+export function resolveStructuredModel(): string {
+  const explicit = process.env.NINE_ROUTER_STRUCTURED_MODEL?.trim();
+  if (explicit) return explicit;
+  const base = process.env.NINE_ROUTER_MODEL?.trim();
+  // A combo/router alias is exactly what we must avoid for JSON phases.
+  if (!base || /combo|router|auto|-stack$/i.test(base)) return 'deepseek-v4.1-flash';
+  return base;
+}
 
 export const PROVIDERS: Record<string, AIProvider> = {
   '9router': {
     id: '9router',
     name: '9Router',
     // User's local proxy is the primary endpoint.
-    baseUrl: process.env.NINE_ROUTER_BASE_URL || 'http://localhost:20128/v1',
+    baseUrl: normalizeBaseUrl(process.env.NINE_ROUTER_BASE_URL || 'http://localhost:20128/v1'),
     envKey: 'NINE_ROUTER_API_KEY',
     format: 'openai',
     resolveModel: (modelId) =>
@@ -52,7 +88,7 @@ export const PROVIDERS: Record<string, AIProvider> = {
     envKey: 'OPENROUTER_API_KEY',
     format: 'openai',
     extraHeaders: {
-      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000',
+      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:5555',
       'X-Title': 'FORGE',
     },
     resolveModel: (id) => OPENROUTER_MODEL_MAP[id] ?? id,
@@ -95,10 +131,32 @@ export function buildProviderCandidates(modelId: string): {
     const apiKey = process.env[provider.envKey];
     if (!apiKey) continue;
     if (candidates.some((c) => c.provider.id === id)) continue;
-    const modelString = provider.resolveModel ? provider.resolveModel(modelId) : modelId;
-    candidates.push({ provider, apiKey, modelString });
+    candidates.push({ provider, apiKey, modelString: fallbackModelFor(id, modelId) });
   }
   return candidates;
+}
+
+/**
+ * Model string to use when `providerId` serves as a FAILOVER target for a
+ * request that was originally addressed to a different provider.
+ *
+ * A fallback must not receive an ID the target can't resolve. Concretely:
+ * 9router rejects OpenRouter-style slugs (`openai/gpt-5` → 404) and only knows
+ * its own catalog (bare `gpt-5`, prefixed `ai/gpt-5.5`, combos like
+ * `Dev-Stack`). So for cross-provider fallback we hand 9router its configured
+ * default model instead of the foreign ID, which would otherwise 404 and burn
+ * the one fallback slot. Same-provider requests keep their exact ID.
+ */
+function fallbackModelFor(providerId: string, modelId: string): string {
+  const provider = PROVIDERS[providerId];
+  const ownProvider = MODEL_PROVIDER_MAP[modelId];
+  if (ownProvider === providerId) {
+    return provider.resolveModel ? provider.resolveModel(modelId) : modelId;
+  }
+  // Cross-provider fallback: prefer the provider's own default, else the raw ID.
+  if (providerId === '9router') return process.env.NINE_ROUTER_MODEL || 'Dev-Stack';
+  if (providerId === 'agentrouter') return provider.resolveModel ? provider.resolveModel(modelId) : modelId;
+  return provider.resolveModel ? provider.resolveModel(modelId) : modelId;
 }
 
 /**
@@ -140,8 +198,10 @@ export async function openProviderStream(params: {
   messages: ChatMessage[];
   signal?: AbortSignal;
   maxTokens?: number;
+  /** See streamFromProvider. 'off' for structured JSON phases. */
+  reasoning?: 'low' | 'off';
 }): Promise<Response> {
-  const { provider, apiKey, modelString, messages, signal, maxTokens } = params;
+  const { provider, apiKey, modelString, messages, signal, maxTokens, reasoning } = params;
   const systemMsg = messages.find((m) => m.role === 'system')?.content ?? '';
   const nonSystem = messages.filter((m) => m.role !== 'system');
 
@@ -157,7 +217,7 @@ export async function openProviderStream(params: {
       providerName: provider.name,
     });
   }
-  return streamFromProvider({ provider, apiKey, model: modelString, messages, signal, maxTokens });
+  return streamFromProvider({ provider, apiKey, model: modelString, messages, signal, maxTokens, reasoning });
 }
 // Each model ID maps to which provider handles it.
 const MODEL_PROVIDER_MAP: Record<string, string> = {
@@ -279,8 +339,23 @@ export async function streamFromProvider(params: {
   signal?: AbortSignal;
   /** Upper bound on completion tokens. Defaults high so long PRDs don't truncate. */
   maxTokens?: number;
+  /**
+   * Reasoning control.
+   * - 'low' (default): ask for the canonical low-effort thinking shape. Good for
+   *   long-form writing, where a little deliberation improves the prose.
+   * - 'off': ask the provider to DISABLE reasoning entirely and send no
+   *   thinking/reasoning params at all.
+   *
+   * 'off' exists for STRUCTURED (JSON) phases. Reasoning buys nothing there and
+   * costs real latency, and on reasoning-heavy routes the model tends to
+   * deliberate until the budget runs out and then emit prose or a tool call
+   * instead of the JSON object. Measured on 9Router/deepseek-v4.1-flash: the
+   * structure payload returns valid JSON in ~6s with thinking off, vs 13-63s
+   * and frequently invalid output with it on.
+   */
+  reasoning?: 'low' | 'off';
 }): Promise<Response> {
-  const { provider, apiKey, model, messages, signal, maxTokens = 16000 } = params;
+  const { provider, apiKey, model, messages, signal, maxTokens = 16000, reasoning = 'low' } = params;
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${apiKey}`,
@@ -290,6 +365,35 @@ export async function streamFromProvider(params: {
 
   const url = `${provider.baseUrl}/chat/completions`;
   const baseBody = { model, messages, stream: true, max_tokens: maxTokens };
+
+  // 'off' sends the plainest possible body — no thinking/reasoning params at
+  // all — so the model answers immediately instead of deliberating.
+  if (reasoning === 'off') {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...baseBody, thinking: { type: 'disabled' } }),
+      signal,
+    });
+    if (res.ok) return res;
+
+    // Fail-open: an endpoint that rejects the thinking object gets the bare body.
+    const errText = await res.text().catch(() => '');
+    if (
+      res.status === 400 &&
+      /thinking|reasoning|unsupported parameter|unknown parameter|unexpected field|unrecognized|extra inputs|not permitted/i.test(errText)
+    ) {
+      const retry = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(baseBody),
+        signal,
+      });
+      if (retry.ok) return retry;
+      throw new Error(describeHttpError(provider.name, retry.status, await retry.text().catch(() => '')));
+    }
+    throw new Error(describeHttpError(provider.name, res.status, errText));
+  }
 
   let res = await fetch(url, {
     method: 'POST',

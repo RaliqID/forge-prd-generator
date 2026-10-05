@@ -10,7 +10,6 @@ import { cn } from '@/lib/utils';
 
 import type { PRDSectionKey } from '@/types';
 
-let mermaidInit = false;
 let diagramSeq = 0;
 
 const MERMAID_SCALE_MIN = 0.4;
@@ -77,7 +76,6 @@ const MermaidDiagram = memo(function MermaidDiagram({ code, defer }: { code: str
           theme: isDark ? 'dark' : 'neutral',
           darkMode: isDark,
         });
-        mermaidInit = true;
         // Validate FIRST. mermaid.render() on invalid syntax injects an error
         // "bomb" SVG into <body> and leaves orphan nodes; parse() with
         // suppressErrors returns false instead of throwing/polluting the DOM.

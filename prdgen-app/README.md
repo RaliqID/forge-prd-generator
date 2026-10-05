@@ -34,10 +34,61 @@ npm install
 cp .env.example .env.local
 # isi DATABASE_URL, ENGINE_ENC_SECRET, dan minimal 1 AI provider key
 npm run db:push
-npm run dev
+npm run dev          # http://localhost:5555
 ```
 
 Detail lengkap (Supabase, dev-mode auth, deployment): lihat [SETUP.md](./SETUP.md).
+
+### One-click launcher (Windows)
+
+`start.bat` menyalakan semuanya — Postgres portable lalu dev server — **tanpa
+jendela console** (tidak ada tab `next-server`/`FORGE postgres` muncul di
+taskbar), lalu membuka browser:
+
+```bat
+start.bat      :: jalankan Postgres + dev server (hidden), buka browser
+stop.bat       :: hentikan keduanya (data tetap aman)
+```
+
+- App berjalan di **port 5555**, bukan 3000 — port 3000 dipakai project lain
+  (Striv) di mesin yang sama. Ubah lewat `set FORGE_PORT=...` sebelum menjalankan.
+- `stop.bat` hanya mematikan proses milik FORGE (lewat PID yang dicatat
+  `start.bat`), jadi project lain di port berdekatan tidak ikut mati.
+- Log ada di `logs/` (`dev.log`, `postgres.log`).
+
+### Scripts
+
+| Script | Fungsi |
+|--------|--------|
+| `npm run dev` | Dev server di port 5555 |
+| `npm run build` / `npm start` | Build + jalankan produksi |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | ESLint |
+| `npm run test` | Unit test (Vitest) |
+| `npm run test:coverage` | Unit test + laporan coverage |
+| `npm run verify` | typecheck + lint + test sekaligus |
+| `npm run db:push` / `db:migrate` / `db:studio` | Prisma |
+
+## Kesehatan Aplikasi
+
+```bash
+curl http://localhost:5555/api/health
+```
+
+```jsonc
+{
+  "status": "healthy",
+  "checks": {
+    "database":        { "status": "ok", "detail": "106ms" },
+    "aiProviders":     { "status": "ok", "detail": "9router" },
+    "auth":            { "status": "missing", "detail": "dev mode (no Supabase configured)" },
+    "structuredModel": { "status": "ok", "detail": "deepseek-v4.1-flash" }
+  }
+}
+```
+
+`503` hanya ketika dependency keras (database) mati. Endpoint ini publik — tidak
+perlu sesi, supaya load balancer/orchestrator bisa memakainya.
 
 ## AI Providers
 
@@ -49,6 +100,19 @@ Detail lengkap (Supabase, dev-mode auth, deployment): lihat [SETUP.md](./SETUP.m
 
 Fallback otomatis: 9Router → AgentRouter → OpenRouter.
 
+### Dua model, dua peran
+
+Ada dua phase dengan kebutuhan berbeda, dan memakai satu model untuk keduanya
+menyebabkan kegagalan nyata:
+
+| Phase | Env | Kebutuhan | Kenapa |
+|-------|-----|-----------|--------|
+| Prose PRD (17 section) | `NINE_ROUTER_MODEL` | Model menulis panjang | Combo alias (`Dev-Stack`) boleh dipakai. |
+| Struktur & Task (JSON) | `NINE_ROUTER_STRUCTURED_MODEL` | **Model instruct eksplisit** | Alias combo me-rotasi upstream; upstream bertipe coding-agent menjawab prompt "hasil JSON" dengan mencoba **menjalankan shell command** (markup tool-call) atau menulis prosa — bukan JSON. Akibatnya feature map kosong dan client retry berkali-kali (±170s terbuang). |
+
+Set `NINE_ROUTER_STRUCTURED_MODEL` ke model instruct eksplisit (contoh
+`deepseek-v4.1-flash`); thinking dimatikan otomatis di phase ini supaya cepat.
+
 ## Environment Variables
 
 <details>
@@ -59,12 +123,25 @@ Fallback otomatis: 9Router → AgentRouter → OpenRouter.
 | `NEXT_PUBLIC_APP_URL` / `NEXT_PUBLIC_BASE_URL` | Base URL untuk SEO, robots, sitemap, header OpenRouter |
 | `DATABASE_URL` / `DIRECT_URL` | Postgres — pooled + direct connection (Supabase atau lokal) |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Auth asli; kosong = dev-mode |
-| `NINE_ROUTER_API_KEY`, `NINE_ROUTER_BASE_URL`, `NINE_ROUTER_MODEL` | Provider AI utama |
+| `NINE_ROUTER_API_KEY`, `NINE_ROUTER_BASE_URL`, `NINE_ROUTER_MODEL` | Provider AI utama (prose) |
+| `NINE_ROUTER_STRUCTURED_MODEL` | Model untuk phase JSON (Struktur/Task) — harus instruct eksplisit |
 | `AGENTROUTER_API_KEY`, `OPENROUTER_API_KEY` | Provider AI alternatif |
 | `ENGINE_ENC_SECRET` | AES-256-GCM untuk enkripsi API key engine tersimpan (wajib) |
 | `ALLOW_LOCAL_AI_ENDPOINTS` | `true` = izinkan base URL localhost untuk custom engine (self-hosted single-user saja) |
+| `AI_STREAM_DEADLINE_MS` / `AI_STREAM_INACTIVITY_MS` | Timeout keseluruhan / tanpa-aktivitas (default 280s / 200s) |
+| `LOG_LEVEL` | `debug`\|`info`\|`warn`\|`error` (default `info`) |
 
 </details>
+
+## Testing & CI
+
+- Unit test ada di `src/lib/**/*.test.ts` (Vitest), dijalankan lewat `npm run test`.
+- `npm run verify` = typecheck + lint + test, dipakai di CI
+  (`.github/workflows/ci.yml`, Node 20 & 22) bersama `npm run build`.
+
+Test menutup logika yang sudah pernah rusak di produksi: pencocokan heading
+section (heading bernomor), ekstraksi JSON (pembungkus prosa/tool-call), dan
+validasi payload API.
 
 ## Struktur Proyek
 

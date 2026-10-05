@@ -104,25 +104,93 @@ export function buildTaskUserPrompt(structure: PlanStructure): string {
 // ── JSON extraction ──
 
 /**
- * Pull the first JSON object out of a model response that may wrap it in a
- * ```json fence or surround it with prose. Returns null if nothing parses.
+ * Scan for the first BALANCED `{...}` span, ignoring braces inside strings.
+ *
+ * A plain indexOf('{')/lastIndexOf('}') slice breaks whenever the model wraps
+ * its payload in prose that itself contains braces, or emits tool-call markup
+ * around the object — the slice then spans multiple candidate objects and no
+ * single JSON.parse succeeds. Walking the string and tracking depth (with
+ * string/escape awareness) yields the first self-contained object instead.
+ * Returns null when no balanced object is found.
+ */
+function firstBalancedObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { if (inString) escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Pull a JSON object out of a model response that may wrap it in a ```json
+ * fence or surround it with prose. Returns null if nothing parses.
  */
 export function extractJson<T = unknown>(raw: string): T | null {
   if (!raw) return null;
 
-  // Prefer a fenced ```json ... ``` block.
+  // Prefer a fenced ```json ... ``` block (most common, most reliable).
   const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenceMatch ? fenceMatch[1] : raw;
+  const sources = fenceMatch ? [fenceMatch[1], raw] : [raw];
 
-  // Fall back to the outermost { ... } span.
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-
-  const jsonText = candidate.slice(start, end + 1);
-  try {
-    return JSON.parse(jsonText) as T;
-  } catch {
-    return null;
+  for (const source of sources) {
+    // Try the whole trimmed span first (fast path for a clean payload).
+    const trimmed = source.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        return JSON.parse(trimmed) as T;
+      } catch {
+        // fall through to the balanced scan
+      }
+    }
+    const balanced = firstBalancedObject(source);
+    if (balanced) {
+      try {
+        return JSON.parse(balanced) as T;
+      } catch {
+        // continue to the next source
+      }
+    }
   }
+  return null;
+}
+
+/**
+ * Heuristic: did the model answer a JSON-contract prompt with something that is
+ * NOT JSON — prose, clarifying questions, or agent tool-call markup?
+ *
+ * Used to turn a confusing "invalid structure" into an actionable message. A
+ * combo/router alias is the usual culprit: its upstreams are coding agents that
+ * try to run a command instead of emitting the requested object.
+ */
+export function looksLikeNonJsonAnswer(raw: string): boolean {
+  if (!raw) return false;
+  const head = raw.slice(0, 600);
+
+  // Only the OPENING fence counts. A valid ```json block has a closing fence
+  // too, and "```" followed by nothing looks identical to a bare bash fence —
+  // matching on any fence flagged every correct payload as a refusal.
+  const firstFence = head.match(/```([A-Za-z0-9_-]*)/);
+  const opensNonJsonFence = Boolean(firstFence && firstFence[1].toLowerCase() !== 'json');
+
+  return (
+    /DSML|invoke name|<\/?tool|function_call|antml:/i.test(raw) ||
+    /^[\s\S]{0,40}(I'?ll|I will|Let me|Sure|Baik|Tentu|Noted|Here'?s how|Saya)/i.test(head) ||
+    /\?{1,2}\s*$/m.test(head) || // ends a line with a question — asking the user
+    opensNonJsonFence // e.g. ```bash ... — the model wrote code, not JSON
+  );
 }

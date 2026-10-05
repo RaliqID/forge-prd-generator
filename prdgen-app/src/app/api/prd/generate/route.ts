@@ -10,6 +10,9 @@ import {
 } from '@/lib/ai/providers';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
 import { isUuid } from '@/lib/is-uuid';
+import { buildHeadingIndex, matchHeading, headingTextOf } from '@/lib/ai/heading-matcher';
+import { parseBody, prdGenerateSchema } from '@/lib/validation/schemas';
+import { requestLogger } from '@/lib/logger';
 import type { Prisma } from '@prisma/client';
 import type { StreamChunk } from '@/lib/ai/providers';
 import type { PRDFormInput, PlanStructure, PRDSectionKey } from '@/types';
@@ -25,20 +28,26 @@ export async function POST(req: Request) {
   const user = await getAuthUser();
   if (!user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
+  // Validate before anything else: a malformed payload must fail fast with a
+  // named field, not a stack trace from deep inside a prompt builder.
+  const parsed = await parseBody(req, prdGenerateSchema);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.data;
+
   const encoder = new TextEncoder();
-  const body = await req.json().catch(() => ({}) as Record<string, unknown>);
-  const modelId = (body?.model_id as string) ?? '9router-auto';
-  const input = body?.input as PRDFormInput | undefined;
+  const log = requestLogger(req, '/api/prd/generate');
+  const modelId = body.model_id ?? '9router-auto';
+  const input = body.input as PRDFormInput | undefined;
   // Struktur → PRD flow: PRD grounded in a reviewed feature structure.
-  const structure = body?.structure as PlanStructure | undefined;
-  const idea = (body?.idea as string | undefined) ?? '';
+  const structure = body.structure as PlanStructure | undefined;
+  const idea = body.idea ?? '';
 
   // Batched generation: client requests a subset of sections per invocation,
   // passing previously-generated sections as consistency context.
   const validKeys = new Set<PRDSectionKey>(PRD_SECTIONS.map((s) => s.key));
-  const rawSections = Array.isArray(body?.sections) ? (body.sections as unknown[]) : [];
+  const rawSections = body.sections ?? [];
   const requestedSet = new Set(
-    rawSections.filter((s): s is PRDSectionKey => typeof s === 'string' && validKeys.has(s as PRDSectionKey))
+    rawSections.filter((s): s is PRDSectionKey => validKeys.has(s as PRDSectionKey))
   );
   // Keep PRD_SECTIONS order; empty/none → all 17.
   const sections: PRDSectionKey[] = requestedSet.size > 0
@@ -46,9 +55,8 @@ export async function POST(req: Request) {
     : PRD_SECTIONS.map((s) => s.key);
 
   const PREVIOUS_CAP = 1500;
-  const rawPrevious = (body?.previous ?? {}) as Record<string, unknown>;
   const previous: Partial<Record<PRDSectionKey, string>> = {};
-  for (const [key, val] of Object.entries(rawPrevious)) {
+  for (const [key, val] of Object.entries(body.previous ?? {})) {
     if (validKeys.has(key as PRDSectionKey) && typeof val === 'string') {
       previous[key as PRDSectionKey] = val.slice(0, PREVIOUS_CAP);
     }
@@ -57,18 +65,23 @@ export async function POST(req: Request) {
   // Custom engine: saved engines are resolved + decrypted server-side from
   // `engine_id`. An explicit base_url+api_key pair (ad-hoc) still works but is
   // SSRF-guarded. User-configured engine wins — built-ins stay as failover.
+  const rawBody = body as unknown as Record<string, unknown>;
   const resolved = await buildEngineCandidates(user.id, {
     model_id: modelId,
-    engine_id: body?.engine_id as string | undefined,
-    base_url: body?.base_url as string | undefined,
-    api_key: body?.api_key as string | undefined,
-    compat: body?.compat as string | undefined,
+    engine_id: body.engine_id,
+    base_url: rawBody.base_url as string | undefined,
+    api_key: rawBody.api_key as string | undefined,
+    compat: rawBody.compat as string | undefined,
   });
   if (!resolved.ok) {
     return new Response(JSON.stringify({ error: resolved.error }), { status: 400 });
   }
   const candidates = resolved.candidates;
   const useRealAI = Boolean(candidates.length > 0 && (input || structure));
+  // The user asked for a real generation but no provider/key is configured.
+  // Falling through to mock content here is indistinguishable from success in
+  // the UI, so say so explicitly instead.
+  const noProviderConfigured = candidates.length === 0 && Boolean(input || structure);
 
   // ── Server-side persistence ──
   // Create (or attach to) the PRD row BEFORE streaming so a client disconnect
@@ -83,7 +96,7 @@ export async function POST(req: Request) {
   const requestedKeys = new Set(sections);
   if (useRealAI) {
     try {
-      const rawPrdId = typeof body?.prd_id === 'string' ? body.prd_id : null;
+      const rawPrdId = typeof body.prd_id === 'string' ? body.prd_id : null;
       const requestedId = isUuid(rawPrdId) ? rawPrdId : null;
       if (requestedId) {
         // Ownership-scoped attach; a foreign/missing id is ignored (create below).
@@ -125,7 +138,7 @@ export async function POST(req: Request) {
     } catch (err) {
       // Persistence is best-effort: the stream still works, and the client's
       // own save-to-DB flow (POST /api/prd) remains the fallback.
-      console.error('[prd/generate] could not init PRD row — continuing without server persistence:', err);
+      log.error('could not init PRD row - continuing without server persistence', { err });
       prdRowId = null;
     }
   }
@@ -175,7 +188,7 @@ export async function POST(req: Request) {
         data: { content: merged as Prisma.InputJsonValue, status: finalStatus },
       });
     } catch (err) {
-      console.error(`[prd/generate] persist (${status}) failed for ${prdRowId}:`, err);
+      log.error('persist failed', { status, prdRowId, err });
     }
   };
 
@@ -187,18 +200,38 @@ export async function POST(req: Request) {
       try {
         if (useRealAI) {
           await streamRealAI(controller, encoder, candidates, { input, structure, idea }, prdId, sections, previous, req.signal, user.id, contentAcc, persistContent);
+        } else if (noProviderConfigured) {
+          controller.enqueue(
+            encoder.encode(
+              sse({
+                type: 'error',
+                message:
+                  'Tidak ada provider AI yang aktif. Isi NINE_ROUTER_API_KEY (dan NINE_ROUTER_BASE_URL) di .env.local, lalu restart dev server — atau pilih custom engine di halaman Engine.',
+              })
+            )
+          );
         } else {
           await streamMock(controller, encoder, prdId);
         }
+        // One success line per completed request, with the numbers that matter
+        // for watching cost and latency (which provider answered, how long).
+        log.info('generation complete', {
+          elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+          sections: sections.length,
+          provider: candidates[0]?.provider.id ?? 'mock',
+          model: candidates[0]?.modelString ?? null,
+          persisted: Boolean(prdRowId),
+        });
       } catch (err) {
         // Mark the row failed but keep whatever sections finished — the
         // workspace resume flow re-generates only the missing ones. Awaited
         // (not fire-and-forget) so the write lands before the function ends.
         await persistContent('failed');
-        // Log server-side: Vercel function logs were empty because nothing was
-        // ever written, making silent-stream failures impossible to diagnose.
+        // A silent-stream failure used to leave the function logs empty, which
+        // made it impossible to diagnose. Log the elapsed time, the requested
+        // sections and the model so the line pins down what was attempted.
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
-        console.error(`[prd/generate] failed after ${elapsed}s (sections: ${sections.join(',')}):`, err);
+        log.error('generation failed', { elapsedSec: elapsed, sections: sections.join(','), modelId, err });
         controller.enqueue(
           encoder.encode(
             sse({ type: 'error', message: err instanceof Error ? err.message : 'Unknown error' })
@@ -415,24 +448,10 @@ async function streamTokens(
 
   const isAllowed = (key: PRDSectionKey) => !allowedKeys || allowedKeys.has(key);
 
-  // Flexible heading matcher: normalize "Goals & Success Metrics" ≈ "goals and success metrics",
-  // "Data Model/Schema" ≈ "data model" — handles the AI writing slightly different heading text.
-  function normalizeHeading(h: string): string {
-    return h
-      .replace(/\band\b|&/g, ' and ')
-      .replace(/[^\w\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-  }
-
-  const titleToKey = new Map(
-    PRD_SECTIONS.map((s) => [normalizeHeading(s.title), s.key])
-  );
-  // Also accept the exact key name as a heading fallback (e.g. 'executive_summary').
-  for (const s of PRD_SECTIONS) {
-    titleToKey.set(s.key.replace(/_/g, ' ').toLowerCase(), s.key);
-  }
+  // Heading matcher lives in its own module (unit-tested): it must tolerate the
+  // numbering/punctuation variants models produce, or no section ever starts
+  // and the whole PRD comes back empty. See src/lib/ai/heading-matcher.ts.
+  const titleToKey = buildHeadingIndex();
 
   outer: for await (const chunk of tokenStream) {
     touch();
@@ -466,8 +485,8 @@ async function streamTokens(
       lineBuffer = lineBuffer.slice(nlIdx + 1);
 
       const raw = line.trim();
-      const heading = raw.startsWith('#') ? raw.replace(/^#+\s*/, '').trim() : null;
-      const matchedKey = heading ? titleToKey.get(normalizeHeading(heading)) : undefined;
+      const heading = headingTextOf(raw);
+      const matchedKey = heading ? matchHeading(titleToKey, heading) : undefined;
 
       // ── Preamble mode: nothing emitted until the first ALLOWED heading. ──
       if (currentSection === null) {

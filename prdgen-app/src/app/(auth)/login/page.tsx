@@ -12,6 +12,30 @@ import { Database, MailCheck } from 'lucide-react';
 // NEXT_PUBLIC_* vars are inlined at build time — safe to read client-side.
 const supabaseConfigured = isSupabaseConfigured();
 
+/**
+ * Poll a protected route until the just-issued dev cookie is accepted.
+ * Bounded (5 tries, 120ms apart ≈ 600ms) so a genuine failure still surfaces
+ * fast instead of hanging the button.
+ */
+async function confirmDevSession(): Promise<boolean> {
+  for (let i = 0; i < 5; i++) {
+    try {
+      // /api/engines requires a session and is cheap; a 401 means the cookie
+      // isn't visible to the server yet.
+      const res = await fetch('/api/engines', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { 'x-session-probe': '1' },
+      });
+      if (res.ok) return true;
+    } catch {
+      // network blip — fall through to the retry delay
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  return false;
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState('');
@@ -28,18 +52,39 @@ export default function LoginPage() {
     const supabase = createClient();
     const { data } = supabase.auth.onAuthStateChange((event, session) => {
       if (session && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION')) {
-        window.location.href = '/dashboard';
+        router.push('/dashboard');
       }
     });
     return () => data.subscription.unsubscribe();
-  }, []);
+  }, [router]);
 
   async function handleDevLogin() {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetch('/api/auth/dev-login', { method: 'POST' });
-      if (!res.ok) throw new Error('dev-login failed');
+      const res = await fetch('/api/auth/dev-login', {
+        method: 'POST',
+        // The session is a Set-Cookie response; never serve it from cache.
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (!res.ok) throw new Error(`dev-login ${res.status}`);
+
+      // The cookie is set by the response, but router.push() can race the
+      // browser's cookie commit — the middleware then sees no session and
+      // bounces straight back to /login, which looks like a dead button.
+      // Confirm the session is actually accepted before navigating, retrying
+      // briefly so a slow commit doesn't surface as a failure.
+      const authed = await confirmDevSession();
+      if (!authed) {
+        // Last resort: a full document navigation, which re-sends cookies from
+        // scratch. The client router can reuse a cached RSC payload that was
+        // fetched without the new session and bounce back to /login; a hard
+        // navigation cannot. Intentional, so the lint rule is disabled here.
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+        window.location.assign('/new');
+        return;
+      }
       router.push('/new');
     } catch {
       setError('Gagal memulai mode dev. Coba lagi.');

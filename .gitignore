@@ -3,4 +3,9 @@ node_modules/
 .env
 .env.local
 .env.*.local
-.slim/deepwork/
+
+# Runtime artifacts written by start.bat/stop.bat: server + Postgres logs and
+# the recorded dev-server PID. Never committed — machine-specific and noisy.
+logs/
+coverage/
+*.tsbuildinfo
