@@ -44,6 +44,7 @@ import { PRD_SECTIONS } from '@/types';
 import { getModelById } from '@/lib/ai/models';
 import { fetchEngineRef } from '@/lib/engines-client';
 import { isUuid } from '@/lib/is-uuid';
+import { deriveStatus } from '@/lib/prd/status';
 import { cn } from '@/lib/utils';
 import type {
   PRD,
@@ -124,6 +125,10 @@ export default function WorkspacePage() {
   // A ref so the long-running generatePRD loop and persist() always see the
   // freshest value regardless of render closures.
   const serverPrdIdRef = useRef<string | null>(null);
+  // Server-reported list of sections still empty after the last request. The
+  // source of truth for "what's left" — more reliable than diffing the group we
+  // asked for, since the model may deliver more or fewer than requested.
+  const serverMissingRef = useRef<PRDSectionKey[]>([]);
 
   // Phase working state
   const [structureLoading, setStructureLoading] = useState(false);
@@ -406,29 +411,52 @@ export default function WorkspacePage() {
     if (!structure) return;
     setActiveStep('prd');
     setPrdStreaming(true);
-    setPrdProgress(0);
-    setPrdContent({});
     setThinking(false);
     const engineRef = await fetchEngineRef(activeModel);
 
     // Local accumulator — synchronously available for completeness checks
     // after the stream ends (state/ref may lag behind due to React batching).
     // Persists across batches so later batches send earlier sections as context.
+    //
+    // Seed FIRST, from what already exists, so a resume only fills blanks.
+    // The previous version cleared the view (`setPrdContent({})`) before doing
+    // this — the data survived in the ref, but the screen went blank, so a run
+    // that stopped part-way looked like it had thrown everything away and the
+    // user reasonably assumed their document had been wiped.
     const contentAcc: Partial<PRDContent> = {};
-    // Resume: seed the accumulator with sections already generated (e.g. from a
-    // prior partial run) so a re-click of Generate only fills what's missing.
     PRD_SECTIONS.forEach((s) => {
       const v = prdContentRef.current[s.key];
       if (v?.trim()) contentAcc[s.key] = v;
     });
+
+    // Show existing content and set progress from it. Nothing is removed here;
+    // only sections that are still empty get (re)generated below.
+    setPrdContent((prev) => ({ ...prev, ...contentAcc }));
+    const alreadyFilled = Object.keys(contentAcc).length;
+    setPrdProgress(Math.round((alreadyFilled / PRD_SECTIONS.length) * 100));
+
+    // Everything is already present — nothing to generate. Just reconcile the
+    // stored status and say so, instead of re-running the whole document.
+    if (alreadyFilled === PRD_SECTIONS.length) {
+      setPrdStreaming(false);
+      markComplete('prd');
+      toast.add({ title: 'PRD sudah lengkap', description: 'Semua 17 section sudah terisi.', type: 'success' });
+      void persist(undefined, contentAcc);
+      return;
+    }
 
     // Request a GROUP of sections in one call. Reasoning engines spend most of
     // a request's time thinking before writing — one section per request paid
     // that thinking cost 17 times and mostly blew the server deadline. A group
     // of 3 shares one thinking phase. Sections that finish keep their content
     // even if the request dies mid-way.
+    //
+    // `keys` is what we ASK for, not a ceiling. Models routinely ignore the
+    // subset instruction and write the whole document; every section that
+    // arrives is kept, because re-requesting one the model already produced
+    // wastes a full generation. `expected` is therefore only used for the
+    // fallback attribution of a headingless answer.
     async function requestGroup(keys: PRDSectionKey[], prevSnapshot: Partial<PRDContent>) {
-      const groupSet = new Set(keys);
       const completed = new Set<PRDSectionKey>();
       let localSection: PRDSectionKey | null = null;
       const ctrl = new AbortController();
@@ -453,16 +481,24 @@ export default function WorkspacePage() {
 
         for await (const event of parseSSEStream(res)) {
           switch (event.type) {
-            case 'section_start':
-              // Defense in depth: a model that spills into another section must
-              // not write into a sibling request's key. Ignore foreign sections.
-              if (!groupSet.has(event.section)) break;
+            case 'section_start': {
+              // Accept ANY section the model produces, not just the requested
+              // ones — a bonus section is finished work we would otherwise
+              // regenerate. Only the headless fallback needs `keys`.
               localSection = event.section;
               setPrdSection(event.section);
               setThinking(false);
-              contentAcc[event.section] = '';
-              setPrdContent((prev) => ({ ...prev, [event.section]: '' }));
+              // Only reset a section that has no content yet. Clearing it
+              // unconditionally destroys an already-generated section whenever
+              // the model re-emits it as a bonus — which it does routinely —
+              // silently replacing finished prose with a fresh, shorter draft.
+              const had = (contentAcc[event.section] ?? '').trim().length > 0;
+              if (!had) {
+                contentAcc[event.section] = '';
+                setPrdContent((prev) => ({ ...prev, [event.section]: '' }));
+              }
               break;
+            }
             case 'token': {
               setThinking(false);
               // Fallback to the first requested key (never a shared mutable) so
@@ -479,7 +515,6 @@ export default function WorkspacePage() {
               setThinking(true);
               break;
             case 'section_end':
-              if (!groupSet.has(event.section)) break;
               completed.add(event.section);
               localSection = null;
               break;
@@ -489,6 +524,15 @@ export default function WorkspacePage() {
               if (event.persisted && isUuid(event.prd_id)) {
                 serverPrdIdRef.current = event.prd_id;
                 setSavedId((prev) => prev ?? event.prd_id);
+              }
+              // The server reports the true document state; adopt it so the
+              // resume logic works from what actually exists in the row rather
+              // than from this request's (possibly over-delivered) group.
+              if (Array.isArray(event.filled)) {
+                for (const k of event.filled as PRDSectionKey[]) completed.add(k);
+              }
+              if (Array.isArray(event.missing)) {
+                serverMissingRef.current = event.missing as PRDSectionKey[];
               }
               break;
             case 'error':
@@ -500,12 +544,17 @@ export default function WorkspacePage() {
           }
         }
       } catch (err) {
-        // Sections that never finished hold half-written garbage. Clear only
-        // those; completed ones keep their content for the resume check.
+        // Clear only sections that are BOTH unfinished AND empty. A section the
+        // model delivered (even as a bonus) must survive a failure on a later
+        // section, otherwise finished work is thrown away and regenerated.
         for (const k of keys) {
-          if (!completed.has(k)) {
-            contentAcc[k] = '';
-            setPrdContent((prev) => ({ ...prev, [k]: '' }));
+          if (!completed.has(k) && (contentAcc[k] ?? '').trim().length === 0) {
+            delete contentAcc[k];
+            setPrdContent((prev) => {
+              const next = { ...prev };
+              delete next[k];
+              return next;
+            });
           }
         }
         throw err;
@@ -514,13 +563,19 @@ export default function WorkspacePage() {
       }
     }
 
-    // Auto-continue: repeat the pass over still-missing sections for up to
-    // MAX_ROUNDS so the user doesn't have to re-click Generate. Sections are
-    // generated sequentially in canonical PRD_SECTIONS order, in groups of 3
-    // per request — free-tier providers 5xx under concurrent load, the user
-    // wants top-to-bottom fill, and reasoning engines pay their thinking cost
-    // once per request instead of once per section.
-    const MAX_ROUNDS = 3;
+    // Auto-continue: repeat the pass over still-missing sections so the user
+    // doesn't have to re-click Generate. Sections are generated sequentially in
+    // canonical PRD_SECTIONS order, in groups of 3 per request — free-tier
+    // providers 5xx under concurrent load, the user wants top-to-bottom fill,
+    // and reasoning engines pay their thinking cost once per request instead of
+    // once per section.
+    //
+    // Rounds are generous because a single response rarely covers every
+    // requested section: the model stops at its output-token cap, so the tail
+    // has to be picked up by later passes. The no-progress guard below (stop
+    // when a round fills nothing new) is what actually bounds the loop, so a
+    // high ceiling costs nothing when the document finishes early.
+    const MAX_ROUNDS = 6;
     const GAP_MS = 400;
     const failed: PRDSectionKey[] = [];
     // First server-side error reason — surfaced once in the final toast so the
@@ -530,8 +585,19 @@ export default function WorkspacePage() {
     // ever finish. Stop retrying and tell the user to switch to a faster model.
     let consecutiveSlow = 0;
     let fatalSlow = false;
+    // What is still empty, derived from the accumulator. This reads the live
+    // document, so a section the model delivered as a bonus is counted as done
+    // and never re-requested — the whole point of accepting spilled sections.
     const missingKeys = () =>
       PRD_SECTIONS.filter((s) => (contentAcc[s.key] ?? '').trim().length === 0).map((s) => s.key);
+
+    // Nothing to do: the document is already complete. Happens when a reload
+    // finds a finished PRD, or a previous request over-delivered every section.
+    if (missingKeys().length === 0) {
+      void persist(undefined, contentAcc);
+      return;
+    }
+
     try {
       for (let round = 1; round <= MAX_ROUNDS; round++) {
         // Circuit breaker tripped in a prior round — stop retrying.
@@ -550,9 +616,15 @@ export default function WorkspacePage() {
         }
 
         // Sections still needing content this round, in canonical order.
-        // Generated in sequential GROUPS of 3 — one request per group shares a
-        // single reasoning phase (the dominant cost on reasoning engines).
-        const GROUP_SIZE = 3;
+        //
+        // GROUP_SIZE balances two costs. Larger groups mean fewer round-trips
+        // (each request carries its own reasoning overhead), but a group whose
+        // response is cut off by the output-token cap loses the sections that
+        // never got written. With the direct writing model — which follows the
+        // section list exactly — a larger group is safe and materially fewer
+        // requests are needed: measured 3-section groups at ~60s each for 17
+        // sections, vs ~4 groups of 5.
+        const GROUP_SIZE = 5;
         const todo = missingKeys();
         // Batch label counts groups for THIS round; a retry round recomputes
         // (and its toast already announces the new pass).
@@ -609,26 +681,32 @@ export default function WorkspacePage() {
 
       // Completeness check: if the model hit its output-token cap or a section
       // timed out, the run finishes with sections missing. Don't claim success.
-      const filledCount = PRD_SECTIONS.filter(
-        (s) => (contentAcc[s.key] ?? '').trim().length > 0
-      ).length;
-      const missingCount = PRD_SECTIONS.length - filledCount;
+      const stillMissing = missingKeys();
+      const missingCount = stillMissing.length;
 
       if (missingCount > 0) {
+        // Name the sections that are missing (by title, not key) so the user
+        // knows exactly what is left instead of a bare count. Capped so a long
+        // list cannot overflow the toast; the workspace banner shows the rest.
+        const missingTitles = stillMissing.map(
+          (k) => PRD_SECTIONS.find((s) => s.key === k)?.title ?? k
+        );
+        const shown = missingTitles.slice(0, 4).join(', ');
+        const extra = missingTitles.length > 4 ? `, +${missingTitles.length - 4} lainnya` : '';
         toast.add({
-          title: 'PRD belum lengkap',
-          description: failed.length > 0
-            ? `${missingCount} section gagal setelah ${MAX_ROUNDS} ronde otomatis${failReason ? ` — ${failReason}` : ''}. Klik Generate PRD lagi untuk coba sisanya.`
-            : `${missingCount} section belum ter-generate (kemungkinan terpotong batas token model). Coba generate ulang atau gunakan model dengan output lebih besar.`,
+          title: `PRD belum lengkap — ${missingCount} dari ${PRD_SECTIONS.length} section kosong`,
+          description: failReason
+            ? `Belum jadi: ${shown}${extra}. Penyebab: ${failReason}`
+            : `Belum jadi: ${shown}${extra}. Bagian yang sudah jadi tetap tersimpan — klik Lanjutkan Generate untuk mengisi sisanya saja.`,
           type: 'error',
         });
         // Persist partial content so the user doesn't lose what was generated.
-        void persist('prd', undefined, contentAcc);
+        void persist(undefined, contentAcc);
       } else {
         setPrdProgress(100);
         markComplete('prd');
         toast.add({ title: 'PRD selesai!', description: 'PRD berhasil dibuat.', type: 'success' });
-        void persist('prd', undefined, contentAcc);
+        void persist(undefined, contentAcc);
       }
     } catch (err) {
       toast.add({
@@ -644,8 +722,11 @@ export default function WorkspacePage() {
   }
 
   // ── Persist to DB (create on first save, then PUT) ──
+  //
+  // The phase that TRIGGERED a save is deliberately not a parameter: status is
+  // derived from the content being saved. It used to be passed in and mapped to
+  // 'completed', which is how a partially generated PRD was recorded as done.
   async function persist(
-    reason: PlanStep,
     structureOverride?: PlanStructure,
     contentOverride?: Partial<PRDContent>
   ) {
@@ -663,7 +744,12 @@ export default function WorkspacePage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             title,
-            status: reason === 'prd' ? 'completed' : 'draft',
+            // Status is DERIVED from the snapshot being saved, not from the
+            // phase that triggered the save. Writing 'completed' because the
+            // PRD step ran is what left a 1-section PRD marked done with an
+            // empty Executive Summary. The server re-derives as well; sending
+            // the honest value keeps the two in step.
+            status: deriveStatus(contentToSave as Partial<PRDContent>),
             content: contentToSave,
             idea,
             structure: structureToSave,
@@ -689,7 +775,8 @@ export default function WorkspacePage() {
             content: contentToSave,
             idea,
             structure: structureToSave,
-            status: 'completed',
+            // Same rule as the POST branch: derived, not hardcoded.
+            status: deriveStatus(contentToSave as Partial<PRDContent>),
             model_used: activeModel,
           }),
         });
@@ -888,7 +975,7 @@ export default function WorkspacePage() {
       const doneMsg = `Section "${PRD_SECTIONS.find((s) => s.key === sectionKey)?.title}" sudah diupdate. Periksa hasilnya di editor.`;
       setThread((prev) => [...prev, { role: 'assistant', content: doneMsg }]);
       persistChat('edit', 'assistant', doneMsg);
-      void persist('prd');
+      void persist();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Terjadi kesalahan';
       setThread((prev) => [...prev, { role: 'assistant', content: `Gagal: ${message}` }]);

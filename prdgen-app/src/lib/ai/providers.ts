@@ -54,9 +54,35 @@ function normalizeBaseUrl(raw: string): string {
 export function resolveStructuredModel(): string {
   const explicit = process.env.NINE_ROUTER_STRUCTURED_MODEL?.trim();
   if (explicit) return explicit;
+  return resolveDirectModel('deepseek-v4.1-flash');
+}
+
+/**
+ * Model used to WRITE the PRD sections.
+ *
+ * Same reasoning as the structured phases, and measured the same way: asked to
+ * produce exactly three named sections, the `Dev-Stack` combo replied in 5s
+ * with a question back to the user and unusable headings, while the direct
+ * model produced the three exact headings in 21s. A combo alias is optimised
+ * for chat, not for following a document contract, and its round-robin makes
+ * behaviour non-deterministic run to run.
+ *
+ * Separate env var so a deployment can tune prose and JSON independently, but
+ * it defaults to the same reliable instruct model.
+ */
+export function resolveWritingModel(): string {
+  const explicit = process.env.NINE_ROUTER_WRITING_MODEL?.trim();
+  if (explicit) return explicit;
+  return resolveStructuredModel();
+}
+
+/**
+ * Fall back to `fallback` when the configured NINE_ROUTER_MODEL is a
+ * combo/router alias, which cannot be trusted to follow an output contract.
+ */
+function resolveDirectModel(fallback: string): string {
   const base = process.env.NINE_ROUTER_MODEL?.trim();
-  // A combo/router alias is exactly what we must avoid for JSON phases.
-  if (!base || /combo|router|auto|-stack$/i.test(base)) return 'deepseek-v4.1-flash';
+  if (!base || /combo|router|auto|-stack$/i.test(base)) return fallback;
   return base;
 }
 

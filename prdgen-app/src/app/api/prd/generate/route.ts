@@ -7,15 +7,17 @@ import {
   openProviderStream,
   parseTokenStream,
   parseAnthropicStream,
+  resolveWritingModel,
 } from '@/lib/ai/providers';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
 import { isUuid } from '@/lib/is-uuid';
 import { buildHeadingIndex, matchHeading, headingTextOf } from '@/lib/ai/heading-matcher';
+import { deriveStatus } from '@/lib/prd/status';
 import { parseBody, prdGenerateSchema } from '@/lib/validation/schemas';
 import { requestLogger } from '@/lib/logger';
 import type { Prisma } from '@prisma/client';
 import type { StreamChunk } from '@/lib/ai/providers';
-import type { PRDFormInput, PlanStructure, PRDSectionKey } from '@/types';
+import type { PRDFormInput, PRDContent, PRDStatus, PlanStructure, PRDSectionKey } from '@/types';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -76,7 +78,15 @@ export async function POST(req: Request) {
   if (!resolved.ok) {
     return new Response(JSON.stringify({ error: resolved.error }), { status: 400 });
   }
-  const candidates = resolved.candidates;
+  // Built-in 9Router candidate: replace the configured alias with the writing
+  // model. The default (`Dev-Stack`) is a combo/router — measured against it,
+  // a "write exactly these three sections" prompt came back in 5s with a
+  // clarifying question and unusable headings, while the direct instruct model
+  // returned the three exact headings. A user-supplied custom engine is left
+  // exactly as configured.
+  const candidates = resolved.candidates.map((c) =>
+    c.provider.id === '9router' ? { ...c, modelString: resolveWritingModel() } : c
+  );
   const useRealAI = Boolean(candidates.length > 0 && (input || structure));
   // The user asked for a real generation but no provider/key is configured.
   // Falling through to mock content here is indistinguishable from success in
@@ -143,8 +153,14 @@ export async function POST(req: Request) {
     }
   }
 
-  /** Merge the accumulated sections into the row. Never throws. */
-  const persistContent = async (status: 'generating' | 'completed' | 'failed') => {
+  /**
+   * Merge the accumulated sections into the row. Never throws.
+   *
+   * `status` is a HINT describing this attempt; the stored value is always
+   * re-derived from the merged content, so the type accepts the full status
+   * union (deriveStatus may legitimately answer 'draft' for an empty row).
+   */
+  const persistContent = async (status: PRDStatus) => {
     if (!prdRowId) return;
     try {
       // Read-modify-write: the workspace flow generates in groups, so an
@@ -180,9 +196,9 @@ export async function POST(req: Request) {
       // the client disconnect races the 'completed' persist — observed: poll
       // read 'completed', the abort handler then wrote 'failed' over 17/17
       // content). Complete content is the source of truth, not the signal.
-      const finalStatus = PRD_SECTIONS.every((s) => (merged[s.key] ?? '').trim().length > 0)
-        ? 'completed'
-        : status;
+      // Delegated to the shared deriver so this route, POST /api/prd and the
+      // client cannot disagree about what "completed" means.
+      const finalStatus = deriveStatus(merged as Partial<PRDContent>, status);
       await prisma.pRD.update({
         where: { id: prdRowId },
         data: { content: merged as Prisma.InputJsonValue, status: finalStatus },
@@ -215,9 +231,13 @@ export async function POST(req: Request) {
         }
         // One success line per completed request, with the numbers that matter
         // for watching cost and latency (which provider answered, how long).
+        // `filled` shows how much of the document exists AFTER this request, so
+        // a slow-but-productive run is distinguishable from a spin.
         log.info('generation complete', {
           elapsedSec: Math.round((Date.now() - startedAt) / 1000),
-          sections: sections.length,
+          requested: sections.length,
+          filled: PRD_SECTIONS.filter((s) => (contentAcc[s.key] ?? '').trim().length > 0).length,
+          total: PRD_SECTIONS.length,
           provider: candidates[0]?.provider.id ?? 'mock',
           model: candidates[0]?.modelString ?? null,
           persisted: Boolean(prdRowId),
@@ -267,7 +287,7 @@ async function streamRealAI(
   clientSignal?: AbortSignal,
   userId?: string,
   contentAcc?: Partial<Record<PRDSectionKey, string>>,
-  persistContent?: (status: 'generating' | 'completed' | 'failed') => Promise<void>,
+  persistContent?: (status: PRDStatus) => Promise<void>,
 ) {
   // Self-improvement: inject excerpts from the user's OWN completed PRDs as
   // few-shot examples (owner-scoped — never other users' content).
@@ -355,11 +375,9 @@ async function streamRealAI(
       await streamTokens(controller, encoder, tokenStream, prdId, touch, allowedKeys, () => attempt.abort(), contentAcc, async () => {
         // Completed only when ALL 17 sections hold content — a workspace flow
         // generates in groups, and its final persist() also flips the status.
+        // Delegated to the shared deriver so the rule lives in one place.
         if (!persistContent) return;
-        const allFilled = contentAcc
-          ? PRD_SECTIONS.every((s) => (contentAcc[s.key] ?? '').trim().length > 0)
-          : false;
-        await persistContent(allFilled ? 'completed' : 'generating');
+        await persistContent(deriveStatus(contentAcc));
       });
       return;
     } catch (err) {
@@ -409,13 +427,16 @@ async function streamRealAI(
 // client can show a live indicator instead of looking frozen.
 // `touch` resets the caller's no-activity timer on every chunk.
 //
-// Section enforcement (`allowedKeys` + `onStop`):
-// - Anything before the first ALLOWED heading is buffered and discarded — models
-//   often open with deliberation/meta-commentary. If no allowed heading ever
-//   arrives the buffer is flushed instead, so headingless output isn't lost.
-// - A heading for a known-but-NOT-requested section ends the current section and
-//   stops the stream: the model has spilled into another request's territory,
-//   and keeping those tokens would corrupt parallel per-section requests.
+// Section handling:
+// - Anything before the first recognised heading is buffered and discarded —
+//   models often open with deliberation/meta-commentary. If no recognised
+//   heading ever arrives the buffer is flushed instead, so headingless output
+//   isn't lost.
+// - EVERY recognised section that arrives is emitted and accumulated, including
+//   ones that were not requested. Models frequently write the whole document in
+//   one response; that work is already paid for, so it is kept rather than
+//   thrown away and regenerated later. `allowedKeys` is used only to attribute
+//   headingless output to the first requested section.
 async function streamTokens(
   controller: ReadableStreamDefaultController,
   encoder: TextEncoder,
@@ -439,14 +460,13 @@ async function streamTokens(
   // flushed as content if the stream ends without any.
   let preambleBuffer = '';
   const PREAMBLE_CAP = 8000;
-  // Set when a non-requested section heading forces an early stop.
+  // Set when the stream was cut short (preamble cap reached). No longer set by
+  // a section spill — unrequested sections are kept, not truncated.
   let stopped = false;
   // Chars of real content emitted THIS attempt (tokens + tail flushes). Zero
   // at stream end means the upstream closed silent-empty → throw so the
   // caller's retry pass engages instead of "succeeding" with nothing.
   let emittedChars = 0;
-
-  const isAllowed = (key: PRDSectionKey) => !allowedKeys || allowedKeys.has(key);
 
   // Heading matcher lives in its own module (unit-tested): it must tolerate the
   // numbering/punctuation variants models produce, or no section ever starts
@@ -488,20 +508,20 @@ async function streamTokens(
       const heading = headingTextOf(raw);
       const matchedKey = heading ? matchHeading(titleToKey, heading) : undefined;
 
-      // ── Preamble mode: nothing emitted until the first ALLOWED heading. ──
+      // ── Preamble mode: nothing emitted until the first known heading. ──
       if (currentSection === null) {
-        if (matchedKey && isAllowed(matchedKey)) {
+        if (matchedKey) {
           // First real section — drop everything buffered before it.
           preambleBuffer = '';
           currentSection = matchedKey;
           controller.enqueue(encoder.encode(sse({ type: 'section_start', section: matchedKey })));
           continue;
         }
-        // Buffer everything else (including non-requested headings).
+        // Buffer everything else (prose the model wrote before any heading).
         preambleBuffer += line + '\n';
         if (preambleBuffer.length > PREAMBLE_CAP) {
-          // Non-compliant model rambling without ever starting a requested
-          // section — stop rather than burn the whole deadline.
+          // Non-compliant model rambling without ever starting a section —
+          // stop rather than burn the whole deadline.
           preambleBuffer = '';
           stopped = true;
           onStop();
@@ -511,16 +531,17 @@ async function streamTokens(
       }
 
       if (matchedKey) {
-        if (!isAllowed(matchedKey)) {
-          // Spilled into another request's section — close ours and stop.
-          controller.enqueue(encoder.encode(sse({ type: 'section_end', section: currentSection })));
-          currentSection = null;
-          lineBuffer = '';
-          stopped = true;
-          onStop();
-          break outer;
-        }
-        // Section boundary — emit section events, skip emitting the heading as content.
+        // Section boundary — emit section events, skip emitting the heading as
+        // content.
+        //
+        // A model frequently keeps going past what was requested and writes the
+        // WHOLE document (all 17 sections) in one response. That output is
+        // free — it is already generated and paid for — so it is ACCEPTED, not
+        // truncated. An earlier version stopped the stream at the first
+        // unrequested heading and threw the rest away; because the model then
+        // did the same thing on the next request, the document never filled and
+        // the UI looped forever. Foreign sections are only a problem if we
+        // discard them.
         controller.enqueue(encoder.encode(sse({ type: 'section_end', section: currentSection })));
         currentSection = matchedKey;
         controller.enqueue(encoder.encode(sse({ type: 'section_start', section: matchedKey })));
@@ -580,11 +601,30 @@ async function streamTokens(
   }
   // Persist BEFORE announcing completion: the client navigates to / reloads
   // the row on this event, and the DB write must already be visible.
-  if (onComplete) await onComplete();
-  // `persisted` tells the client prd_id is a real DB row id (safe to PUT,
-  // share, and reload). Fake ids (mock path) are 'prd-<timestamp>'.
-  controller.enqueue(encoder.encode(sse({ type: 'done', prd_id: prdId, persisted: isUuid(prdId) })));
-}
+    if (onComplete) await onComplete();
+    // `persisted` tells the client prd_id is a real DB row id (safe to PUT,
+    // share, and reload). Fake ids (mock path) are 'prd-<timestamp>'.
+    //
+    // `filled` / `missing` report the true document state after this request,
+    // across ALL sections (not just the ones asked for). The client uses them to
+    // state precisely what remains instead of inferring it from a group it may
+    // have over-delivered on.
+    const filledKeys = contentAcc
+      ? PRD_SECTIONS.filter((s) => (contentAcc[s.key] ?? '').trim().length > 0).map((s) => s.key)
+      : [];
+    const missingKeys = PRD_SECTIONS.filter((s) => !filledKeys.includes(s.key)).map((s) => s.key);
+    controller.enqueue(
+      encoder.encode(
+        sse({
+          type: 'done',
+          prd_id: prdId,
+          persisted: isUuid(prdId),
+          filled: filledKeys,
+          missing: missingKeys,
+        })
+      )
+    );
+  }
 
 // ── Mock streaming (no API key configured) ──
 async function streamMock(

@@ -100,18 +100,42 @@ perlu sesi, supaya load balancer/orchestrator bisa memakainya.
 
 Fallback otomatis: 9Router → AgentRouter → OpenRouter.
 
-### Dua model, dua peran
+### Tiga model, tiga peran
 
-Ada dua phase dengan kebutuhan berbeda, dan memakai satu model untuk keduanya
-menyebabkan kegagalan nyata:
+Ada tiga phase dengan kebutuhan berbeda, dan memakai satu model untuk semuanya
+menyebabkan dua kegagalan nyata yang sudah diperbaiki:
 
 | Phase | Env | Kebutuhan | Kenapa |
 |-------|-----|-----------|--------|
-| Prose PRD (17 section) | `NINE_ROUTER_MODEL` | Model menulis panjang | Combo alias (`Dev-Stack`) boleh dipakai. |
+| Prose PRD (17 section) | `NINE_ROUTER_WRITING_MODEL` | **Model instruct eksplisit** | Combo alias menjawab prompt "tulis tepat 3 section ini" dengan **pertanyaan balik** dan heading ngaco — section tidak pernah match, run retry 20+ menit tanpa selesai. Model langsung menuruti daftar section dan menyelesaikan 17/17 dalam ~4 menit. |
 | Struktur & Task (JSON) | `NINE_ROUTER_STRUCTURED_MODEL` | **Model instruct eksplisit** | Alias combo me-rotasi upstream; upstream bertipe coding-agent menjawab prompt "hasil JSON" dengan mencoba **menjalankan shell command** (markup tool-call) atau menulis prosa — bukan JSON. Akibatnya feature map kosong dan client retry berkali-kali (±170s terbuang). |
+| Label/legacy | `NINE_ROUTER_MODEL` | Alias combo boleh | **Tidak** dipakai untuk PRD atau JSON karena alasan di atas. |
 
-Set `NINE_ROUTER_STRUCTURED_MODEL` ke model instruct eksplisit (contoh
-`deepseek-v4.1-flash`); thinking dimatikan otomatis di phase ini supaya cepat.
+Ketiganya boleh menunjuk model yang sama (`deepseek-v4.1-flash`) — env terpisah
+ada supaya bisa di-tuning terpisah. Thinking dimatikan otomatis di phase JSON.
+
+**Cara kerja resume (tidak menimpa yang sudah jadi)**
+
+1. Workspace memuat PRD dari DB; section yang sudah ada **ditampilkan apa adanya**.
+2. Klik Generate / Lanjutkan → hanya section yang **masih kosong** yang diminta.
+   Section yang sudah terisi tidak pernah dikosongkan atau ditulis ulang.
+3. Model kadang menulis **lebih banyak** dari yang diminta. Section bonus itu
+   **disimpan**, bukan dibuang — jadi tidak perlu di-generate ulang.
+4. Section yang lewat batas token diambil di ronde berikutnya; ronde berhenti
+   otomatis kalau tidak ada kemajuan lagi.
+5. Kalau ada yang belum selesai, toast menyebutkan **judul section yang kurang**
+   (bukan cuma jumlahnya).
+
+**Kenapa lebih cepat**
+
+Group per request dinaikkan dari 3 → 5 section. Dengan model instruct yang
+menuruti daftar section, group besar aman dan total request turun drastis:
+
+| | Sebelum | Sesudah |
+|---|---|---|
+| Section selesai | 3/17 (nyangkut) | **17/17** |
+| Waktu | 20+ menit (tidak selesai) | **~4 menit** |
+| Request | 14+ | **4** |
 
 ## Environment Variables
 
@@ -123,7 +147,8 @@ Set `NINE_ROUTER_STRUCTURED_MODEL` ke model instruct eksplisit (contoh
 | `NEXT_PUBLIC_APP_URL` / `NEXT_PUBLIC_BASE_URL` | Base URL untuk SEO, robots, sitemap, header OpenRouter |
 | `DATABASE_URL` / `DIRECT_URL` | Postgres — pooled + direct connection (Supabase atau lokal) |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Auth asli; kosong = dev-mode |
-| `NINE_ROUTER_API_KEY`, `NINE_ROUTER_BASE_URL`, `NINE_ROUTER_MODEL` | Provider AI utama (prose) |
+| `NINE_ROUTER_API_KEY`, `NINE_ROUTER_BASE_URL`, `NINE_ROUTER_MODEL` | Provider AI utama (koneksi + label) |
+| `NINE_ROUTER_WRITING_MODEL` | Model penulis 17 section PRD — harus instruct eksplisit |
 | `NINE_ROUTER_STRUCTURED_MODEL` | Model untuk phase JSON (Struktur/Task) — harus instruct eksplisit |
 | `AGENTROUTER_API_KEY`, `OPENROUTER_API_KEY` | Provider AI alternatif |
 | `ENGINE_ENC_SECRET` | AES-256-GCM untuk enkripsi API key engine tersimpan (wajib) |

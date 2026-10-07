@@ -107,9 +107,17 @@ export type StreamEvent =
   | { type: 'section_start'; section: PRDSectionKey }
   | { type: 'token'; content: string }
   | { type: 'thinking' }
-  | { type: 'section_end'; section: PRDSectionKey }
-  | { type: 'done'; prd_id: string; persisted?: boolean }
-  | { type: 'error'; message: string };
+    | { type: 'section_end'; section: PRDSectionKey }
+    | {
+        type: 'done';
+        prd_id: string;
+        persisted?: boolean;
+        /** Section keys holding content after this request (all sections). */
+        filled?: PRDSectionKey[];
+        /** Section keys still empty after this request (all sections). */
+        missing?: PRDSectionKey[];
+      }
+    | { type: 'error'; message: string };
 
 // ── Workspace Plan (Struktur → PRD → Task flow) ──
 
