@@ -18,6 +18,7 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { usePRDStore } from '@/stores/prd-store';
 import { cn } from '@/lib/utils';
+import { IDEA_MAX_CHARS } from '@/lib/validation/limits';
 
 interface CustomEngine {
   id: string;
@@ -102,6 +103,13 @@ export default function NewPlanPage() {
   const [testing, setTesting] = useState<Record<string, TestResult | undefined>>({});
   // Test state for the unsaved config inside the Add/Edit dialog.
   const [dialogTest, setDialogTest] = useState<TestResult | null>(null);
+
+  // Idea length feedback. Counted on the raw value (not trimmed) because the
+  // limit is enforced on what is actually sent. "Near" warns at 90% so the cap
+  // is discovered while typing, not by a rejected submit.
+  const ideaLength = idea.length;
+  const ideaOverLimit = ideaLength > IDEA_MAX_CHARS;
+  const ideaNearLimit = !ideaOverLimit && ideaLength >= IDEA_MAX_CHARS * 0.9;
 
   // Load the user's engines from the database (keys stay server-side, only
   // masks are returned). Empty list → fall back to the built-in Dev-Stack
@@ -215,6 +223,12 @@ export default function NewPlanPage() {
   const handleSubmit = useCallback(() => {
     if (idea.trim().length < 20) {
       setError('Ceritakan idemu minimal 20 karakter.');
+      return;
+    }
+    if (idea.length > IDEA_MAX_CHARS) {
+      setError(
+        `Ide terlalu panjang: maksimal ${IDEA_MAX_CHARS.toLocaleString('id-ID')} karakter (~50.000 kata). Pecah menjadi beberapa perencanaan.`
+      );
       return;
     }
     if (attachments.some((a) => a.status === 'extracting')) {
@@ -532,14 +546,35 @@ export default function NewPlanPage() {
               {error ? (
                 <p className="text-xs text-stamp">{error}</p>
               ) : (
-                <p className={cn('font-mono text-xs', idea.trim().length < 20 ? 'text-ink-faint' : 'text-primary')}>
-                  {idea.trim().length} karakter
+                <p
+                  className={cn(
+                    'font-mono text-xs tabular-nums',
+                    ideaOverLimit
+                      ? 'text-stamp'
+                      : ideaNearLimit
+                        ? 'text-stamp/80'
+                        : idea.trim().length < 20
+                          ? 'text-ink-faint'
+                          : 'text-primary'
+                  )}
+                  aria-live="polite"
+                >
+                  {idea.trim().length.toLocaleString('id-ID')}
+                  <span className="text-ink-faint">
+                    {' / '}
+                    {IDEA_MAX_CHARS.toLocaleString('id-ID')} karakter
+                  </span>
                 </p>
               )}
               {attachments.length === 0 && (
                 <p className="text-xs text-ink-faint">Bisa juga seret file ke sini</p>
               )}
             </div>
+            {ideaOverLimit && (
+              <p className="mt-1 text-xs text-stamp">
+                Ide melebihi batas — ringkas atau pecah menjadi beberapa perencanaan.
+              </p>
+            )}
           </section>
 
           {/* AI Engine selector */}
@@ -687,11 +722,12 @@ export default function NewPlanPage() {
           </section>
 
           {/* CTA */}
-          <Button
-            onClick={handleSubmit}
-            size="lg"
-            className="stagger-reveal stagger-4 btn-goo h-12 w-full gap-2.5 rounded-md bg-primary font-semibold text-primary-foreground shadow-md transition-all hover:bg-primary/90 hover:shadow-lg"
-          >
+            <Button
+              onClick={handleSubmit}
+              disabled={ideaOverLimit}
+              size="lg"
+              className="stagger-reveal stagger-4 btn-goo h-12 w-full gap-2.5 rounded-md bg-primary font-semibold text-primary-foreground shadow-md transition-all hover:bg-primary/90 hover:shadow-lg"
+            >
             <Sparkles className="size-4" />
             Mulai Perencanaan
           </Button>

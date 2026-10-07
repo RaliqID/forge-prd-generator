@@ -133,6 +133,34 @@ Set `NINE_ROUTER_STRUCTURED_MODEL` ke model instruct eksplisit (contoh
 
 </details>
 
+## Batas Input
+
+Semua batas panjang & jumlah ada di satu file: **`src/lib/validation/limits.ts`**,
+masing-masing dengan alasan ukurannya. Ringkasan budget yang penting:
+
+| Input | Batas | Kira-kira |
+|-------|-------|-----------|
+| **Ide** (textarea halaman baru) | `IDEA_MAX_CHARS` = 300.000 karakter | **~50.000 kata** |
+| Field naratif form (deskripsi, target users, problem, catatan) | `FIELD_MAX_CHARS` = 20.000 karakter | ~3.300 kata |
+| Label pendek (nama produk, timeline, nama fitur) | `LABEL_MAX_CHARS` = 600 karakter | ~100 kata |
+| Satu section PRD (sebagai konteks) | `SECTION_CONTENT_MAX_CHARS` = 200.000 karakter | ~33.000 kata |
+| Jumlah fitur / tech stack / platform | 200 / 100 / 40 item | — |
+
+Context window provider yang dipakai ±1M token dengan budget output 384K token,
+jadi brief panjang bukan hambatan teknis — batas ini ada untuk membatasi memori
+dan menolak payload yang tidak wajar, dan dipasang jauh di atas pemakaian nyata.
+
+**Perilaku saat melebihi batas**
+
+- UI: counter di bawah textarea menampilkan `terpakai / 300.000` dan berubah
+  warna mulai 90% pemakaian; tombol submit dinonaktifkan saat sudah lewat batas.
+- API: `422` dengan pesan yang menyebut batasnya dalam karakter **dan** kata,
+  contoh: `Ide terlalu panjang: maksimal 300.000 karakter (~50.000 kata).`
+  (bukan lagi `Too big: expected string to have <=20000 characters`).
+
+Untuk mengubah batas, cukup edit `limits.ts` — schema validasi, pesan error, dan
+counter UI semuanya membaca dari sana.
+
 ## Testing & CI
 
 - Unit test ada di `src/lib/**/*.test.ts` (Vitest), dijalankan lewat `npm run test`.

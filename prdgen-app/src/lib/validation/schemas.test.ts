@@ -6,6 +6,7 @@ import {
   formatIssues,
   parseBody,
 } from './schemas';
+import { IDEA_MAX_CHARS, FIELD_MAX_CHARS } from './limits';
 
 /**
  * Validation exists because an unvalidated PRD payload crashed deep inside the
@@ -113,12 +114,69 @@ describe('planStructureRequestSchema', () => {
 });
 
 describe('formatIssues', () => {
-  it('names the failing path', () => {
+  it('names the failing path for a structural mismatch', () => {
     const r = prdFormInputSchema.safeParse({ product_name: 'X', features: 'nope' });
     expect(r.success).toBe(false);
     if (!r.success) {
       const msg = formatIssues(r.error);
       expect(msg).toContain('features');
+    }
+  });
+
+  it('uses the schema\'s own user-facing message for a limit violation', () => {
+    const r = planStructureRequestSchema.safeParse({ idea: 'x'.repeat(IDEA_MAX_CHARS + 1) });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const msg = formatIssues(r.error);
+      // Readable, states the cap, and does not leak Zod's "Too big" wording.
+      expect(msg).toContain('Ide terlalu panjang');
+      expect(msg).toContain('50.000 kata');
+      expect(msg).not.toMatch(/Too big/i);
+      expect(msg).not.toMatch(/Invalid input/i);
+    }
+  });
+});
+
+describe('idea length budget (~50k words)', () => {
+  it('accepts a 50,000-word brief', () => {
+    // "kata " is 5 chars, so this is 250k chars — a 50k-word brief with short
+    // words, comfortably inside the 300k budget.
+    const fiftyThousandWords = 'kata '.repeat(50_000);
+    expect(fiftyThousandWords.length).toBeGreaterThan(200_000);
+    const r = planStructureRequestSchema.safeParse({ idea: fiftyThousandWords });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts a full-budget 300k-character brief', () => {
+    const r = prdGenerateSchema.safeParse({ idea: 'w'.repeat(IDEA_MAX_CHARS) });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects one character over the cap', () => {
+    const r = prdGenerateSchema.safeParse({ idea: 'w'.repeat(IDEA_MAX_CHARS + 1) });
+    expect(r.success).toBe(false);
+  });
+
+  it('no longer rejects at the old 20k boundary', () => {
+    // Regression guard: 20 001 chars used to fail with "Too big".
+    const r = planStructureRequestSchema.safeParse({ idea: 'w'.repeat(20_001) });
+    expect(r.success).toBe(true);
+  });
+
+  it('keeps the ~3.3k-word cap on narrative form fields', () => {
+    const ok = prdFormInputSchema.safeParse({
+      product_name: 'X',
+      description: 'w'.repeat(FIELD_MAX_CHARS),
+    });
+    expect(ok.success).toBe(true);
+
+    const tooLong = prdFormInputSchema.safeParse({
+      product_name: 'X',
+      description: 'w'.repeat(FIELD_MAX_CHARS + 1),
+    });
+    expect(tooLong.success).toBe(false);
+    if (!tooLong.success) {
+      expect(formatIssues(tooLong.error)).toContain('Deskripsi terlalu panjang');
     }
   });
 });
@@ -145,6 +203,19 @@ describe('parseBody', () => {
       expect(parsed.response.status).toBe(422);
       const body = await parsed.response.json();
       expect(body.error).toContain('features');
+    }
+  });
+
+  it('returns 422 with a readable reason when the idea is over budget', async () => {
+    const parsed = await parseBody(
+      reqWith({ idea: 'x'.repeat(IDEA_MAX_CHARS + 1) }),
+      planStructureRequestSchema
+    );
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.response.status).toBe(422);
+      const body = await parsed.response.json();
+      expect(body.error).toContain('Ide terlalu panjang');
     }
   });
 
