@@ -77,6 +77,28 @@ export function resolveWritingModel(): string {
 }
 
 /**
+ * Ordered model fallbacks for the 9Router provider.
+ *
+ * A single upstream model can run out of credit — 9Router surfaces that as a
+ * 503 whose body says "can only afford N tokens". Retrying the same model just
+ * fails again until the quota resets, so the useful move is to try a different
+ * model. `NINE_ROUTER_MODEL` (a combo alias) is included as the last resort
+ * because a combo fans out across providers and therefore survives one
+ * upstream's credit exhaustion.
+ *
+ * Configure with `NINE_ROUTER_MODEL_FALLBACKS` (comma-separated) to override.
+ */
+export function resolveModelFallbacks(primary: string): string[] {
+  const explicit = process.env.NINE_ROUTER_MODEL_FALLBACKS?.trim();
+  const configured = explicit
+    ? explicit.split(',').map((m) => m.trim()).filter(Boolean)
+    : [process.env.NINE_ROUTER_MODEL?.trim() || 'Dev-Stack'];
+
+  // De-duplicate and drop the primary (no point retrying it immediately).
+  return [...new Set(configured)].filter((m) => m && m !== primary);
+}
+
+/**
  * Fall back to `fallback` when the configured NINE_ROUTER_MODEL is a
  * combo/router alias, which cannot be trusted to follow an output contract.
  */
@@ -315,15 +337,41 @@ export type { ChatMessage };
 
 /**
  * Turn a non-200 provider response into a short, user-readable error.
+ *
  * Free-tier proxies often return an opaque HTML error page (Cloudflare 5xx);
  * we never surface that raw HTML — just a mapped reason. A short, non-HTML
  * body is appended for context.
+ *
+ * The body is ALSO inspected for specific, actionable causes before falling
+ * back to a status-code guess. This matters because the status alone lies: an
+ * exhausted credit balance arrives as **503**, which naively maps to "server
+ * busy" and sends the user off retrying a request that can never succeed. The
+ * real cause ("requested up to 16000 tokens, but can only afford 2085") was
+ * being thrown away by a 200-character cutoff, so the one message that
+ * explained the failure never reached the screen.
  */
-function describeHttpError(providerName: string, status: number, body: string): string {
+export function describeHttpError(providerName: string, status: number, body: string): string {
   const trimmed = body.trim();
   const isHtml = trimmed.startsWith('<')
     || /<!DOCTYPE/i.test(trimmed)
     || /<html/i.test(trimmed);
+
+  // ── Specific causes that override the status code ──
+  // Credit/quota exhaustion is reported by several gateways as 402, 429 or 503.
+  const creditMatch = trimmed.match(/can only afford (\d+)/i);
+  const isCredit = /requires more credits|insufficient[ _]?(credits|quota|balance)|exceeded your current quota|billing/i.test(trimmed);
+  if (isCredit) {
+    const afford = creditMatch ? ` Sisa kuota: ${creditMatch[1]} token.` : '';
+    return `${providerName}: kredit/kuota provider habis.${afford} Isi ulang kredit, atau turunkan max_tokens / ganti model.`;
+  }
+  // Context-length overflow is a request problem, not a server problem.
+  if (/context length|maximum context|too many tokens|prompt is too long/i.test(trimmed)) {
+    return `${providerName}: prompt melebihi context window model. Perkecil input atau pakai model ber-context lebih besar.`;
+  }
+  // Model genuinely unavailable upstream.
+  if (/no available (channel|provider)|model not found|does not exist/i.test(trimmed)) {
+    return `${providerName}: model tidak tersedia di provider ini. Pilih model lain.`;
+  }
 
   let reason: string;
   if (status === 429) reason = 'rate limit — terlalu banyak request, coba lagi sebentar';
@@ -335,8 +383,11 @@ function describeHttpError(providerName: string, status: number, body: string): 
   else reason = `HTTP ${status}`;
 
   let msg = `${providerName}: ${reason}`;
-  if (!isHtml && trimmed && trimmed.length <= 200) {
-    msg += ` — ${trimmed.slice(0, 200)}`;
+  // Include the provider's own words when they are readable. The old 200-char
+  // cap silently dropped every useful (and every long) explanation.
+  if (!isHtml && trimmed) {
+    const excerpt = trimmed.replace(/\s+/g, ' ').slice(0, 300);
+    msg += ` — ${excerpt}`;
   }
   return msg;
 }

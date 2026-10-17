@@ -168,6 +168,26 @@ export const refineSchema = engineRequestSchema.extend({
   content: z.string().max(SECTION_CONTENT_MAX_CHARS).optional(),
 });
 
+// ── Saved PRDs ──
+
+/**
+ * Payload for creating/updating a saved PRD row.
+ *
+ * `status` is accepted but ignored by the route — it is derived from content
+ * (see lib/prd/status). It stays in the schema so existing clients keep working
+ * instead of getting a 422 for sending a field that is simply not trusted.
+ */
+export const prdSaveSchema = z.object({
+  title: boundedText(LABEL_MAX_CHARS, 100, 'Judul').optional(),
+  description: boundedText(FIELD_MAX_CHARS, 3_300, 'Deskripsi').nullish(),
+  status: z.enum(['draft', 'generating', 'completed', 'failed']).optional(),
+  content: z.record(z.string(), z.string().max(SECTION_CONTENT_MAX_CHARS)).nullish(),
+  markdown_content: z.string().max(SECTION_CONTENT_MAX_CHARS * 2).nullish(),
+  model_used: z.string().max(ID_MAX_CHARS).nullish(),
+  idea: boundedText(IDEA_MAX_CHARS, 50_000, 'Ide').nullish(),
+  structure: z.unknown().nullish(),
+});
+
 // ── Custom engines ──
 
 export const customEngineSchema = z.object({

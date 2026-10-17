@@ -331,7 +331,14 @@ export default function WorkspacePage() {
 
     const capturedIdea = usePRDStore.getState().pendingIdea ?? pendingIdea ?? '';
     if (!capturedIdea) {
-      toast.add({ title: 'Ide tidak ditemukan', description: 'Mulai lagi dari halaman baru.', type: 'error' });
+      // No idea in the store. This is what happens on a RELOAD of
+      // /workspace/<id>?generate=true: the query string still says "generate"
+      // but the in-memory store was reset, so the page used to dead-end with
+      // "Ide tidak ditemukan" even though the idea may already exist server-side.
+      //
+      // Recover instead of failing: pull the row for this workspace id and, if
+      // it carries an idea and no structure yet, continue from there.
+      void recoverAndGenerate();
       return;
     }
     // Snapshot the skill selection before the store entry is cleared.
@@ -343,6 +350,87 @@ export default function WorkspacePage() {
     void generateStructure(capturedIdea);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldGenerate]);
+
+  /**
+   * Resume a generate-jump after a reload.
+   *
+   * Looks the workspace row up by id. Three outcomes:
+   *  - row has a structure already → restore it and don't regenerate anything
+   *    (the user can continue to the PRD phase)
+   *  - row has an idea but no structure → regenerate the structure from it
+   *  - no row (or no idea) → a genuine dead end; tell the user plainly
+   *
+   * Idempotent by construction: it never starts a second generation for a
+   * workspace that already has a structure.
+   */
+  async function recoverAndGenerate() {
+    let row: {
+      id?: string;
+      idea?: string | null;
+      structure?: PlanStructure | null;
+      content?: Partial<PRDContent> | null;
+      title?: string | null;
+      model_used?: string | null;
+    } | null = null;
+
+    try {
+      const res = await fetch(`/api/prd/${workspaceId}`);
+      if (res.ok) {
+        const json = await res.json();
+        row = json?.data ?? null;
+      }
+    } catch {
+      // Network failure falls through to the dead-end message below.
+    }
+
+    if (row?.structure) {
+      // Already generated — restore and stop. Regenerating here would discard
+      // work and burn tokens for no reason.
+      setTitle(row.title ?? 'Perencanaan');
+      setIdea(row.idea ?? '');
+      if (row.model_used) setActiveModel(row.model_used);
+      setStructure(row.structure);
+      if (row.content) setPrdContent(row.content);
+      if (row.id) {
+        setSavedId(row.id);
+        serverPrdIdRef.current = row.id;
+      }
+      const done: PlanStep[] = ['structure'];
+      if (row.content && Object.keys(row.content).length > 0) done.push('prd');
+      setCompletedSteps(done);
+      setActiveStep(done.includes('prd') ? 'prd' : 'structure');
+      toast.add({
+        title: 'Perencanaan dipulihkan',
+        description: 'Struktur yang sudah dibuat dimuat ulang — tidak ada yang di-generate ulang.',
+        type: 'success',
+      });
+      return;
+    }
+
+    if (row?.idea?.trim()) {
+      // Row exists with an idea but no structure: continue from the idea.
+      if (row.model_used) setActiveModel(row.model_used);
+      if (row.id) {
+        setSavedId(row.id);
+        serverPrdIdRef.current = row.id;
+      }
+      toast.add({
+        title: 'Melanjutkan perencanaan',
+        description: 'Ide dipulihkan dari penyimpanan — struktur dilanjutkan dari situ.',
+        type: 'info',
+      });
+      void generateStructure(row.idea);
+      return;
+    }
+
+    // Genuinely nothing to resume.
+    toast.add({
+      title: 'Ide tidak ditemukan',
+      description:
+        'Sesi ini tidak menyimpan ide. Mulai perencanaan baru — ide yang sudah pernah di-generate tetap ada di daftar PRD.',
+      type: 'error',
+    });
+  }
 
   // ── Phase 1: Structure ──
   async function generateStructure(ideaText: string) {

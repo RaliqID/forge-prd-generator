@@ -137,6 +137,17 @@ menuruti daftar section, group besar aman dan total request turun drastis:
 | Waktu | 20+ menit (tidak selesai) | **~4 menit** |
 | Request | 14+ | **4** |
 
+**Kalau provider kehabisan kredit**
+
+9Router melaporkan kredit habis sebagai **503**, bukan 402. Aplikasi sekarang
+mendeteksi ini dari isi respons dan:
+
+1. Menampilkan penyebab sebenarnya, bukan "server sibuk":
+   `9Router: kredit/kuota provider habis. Sisa kuota: 2085 token.`
+2. Mencoba **model fallback** otomatis (`NINE_ROUTER_MODEL_FALLBACKS`, default
+   `Dev-Stack`) — combo fan-out ke beberapa provider, jadi selamat saat satu
+   upstream habis.
+
 ## Engineering Skills
 
 PRD bisa ditulis mengikuti **standar engineering** dari skills yang terpasang di

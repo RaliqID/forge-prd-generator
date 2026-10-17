@@ -8,6 +8,7 @@ import {
   parseTokenStream,
   parseAnthropicStream,
   resolveWritingModel,
+  resolveModelFallbacks,
 } from '@/lib/ai/providers';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
 import { isUuid } from '@/lib/is-uuid';
@@ -86,9 +87,20 @@ export async function POST(req: Request) {
   // clarifying question and unusable headings, while the direct instruct model
   // returned the three exact headings. A user-supplied custom engine is left
   // exactly as configured.
-  const candidates = resolved.candidates.map((c) =>
-    c.provider.id === '9router' ? { ...c, modelString: resolveWritingModel() } : c
-  );
+  const candidates = resolved.candidates.flatMap((c) => {
+    if (c.provider.id !== '9router') return [c];
+    const primary = { ...c, modelString: resolveWritingModel() };
+    // Append fallback models for the same provider. A single upstream can run
+    // out of credit, and 9Router reports that as a 503 — retrying the same
+    // model then fails until the quota resets. Trying a different model (the
+    // combo alias last, since it fans out across providers) is what actually
+    // recovers.
+    const fallbacks = resolveModelFallbacks(primary.modelString).map((m) => ({
+      ...c,
+      modelString: m,
+    }));
+    return [primary, ...fallbacks];
+  });
 
   // ── Engineering skills ──
   // Explicit selection wins. Otherwise, in auto mode, pick the skills that match

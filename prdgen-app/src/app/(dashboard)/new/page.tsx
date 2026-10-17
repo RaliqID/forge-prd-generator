@@ -226,7 +226,7 @@ export default function NewPlanPage() {
     if (e.dataTransfer.files?.length) uploadFiles(e.dataTransfer.files);
   }
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback(async () => {
     if (idea.trim().length < 20) {
       setError('Ceritakan idemu minimal 20 karakter.');
       return;
@@ -260,7 +260,37 @@ export default function NewPlanPage() {
       engineId: engine.builtin ? undefined : engine.id,
     }, selectedSkills, autoSkills);
 
-    const workspaceId = `plan-${Date.now()}`;
+    // Create the PRD row BEFORE navigating, so the idea exists server-side from
+    // the first moment. Without this the row was only created after the
+    // structure finished: reloading the workspace in between found nothing and
+    // dead-ended with "Ide tidak ditemukan", losing the run.
+    //
+    // A failure here is not fatal — the workspace can still generate and save
+    // later — so it only logs.
+    let workspaceId = `plan-${Date.now()}`;
+    try {
+      const res = await fetch('/api/prd', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: 'Perencanaan Baru',
+          idea: fullIdea,
+          // Nothing generated yet: the server derives status from content, so
+          // this is a draft regardless of what is sent.
+          content: {},
+          model_used: modelId,
+        }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const realId = json?.data?.id;
+        if (typeof realId === 'string' && realId.length > 0) workspaceId = realId;
+      }
+    } catch {
+      // Fall back to the local plan-<timestamp> id; the workspace will create
+      // the row itself once it starts persisting.
+    }
+
     router.push(`/workspace/${workspaceId}?generate=true&model=${encodeURIComponent(modelId)}`);
   }, [idea, attachments, selectedModel, customEngines, router, setPendingIdea, selectedSkills, autoSkills]);
 

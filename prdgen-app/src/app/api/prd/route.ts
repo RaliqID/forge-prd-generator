@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/db/prisma';
 import { getAuthUser } from '@/lib/auth/get-auth-user';
 import { deriveStatus } from '@/lib/prd/status';
+import { parseBody, prdSaveSchema } from '@/lib/validation/schemas';
 import type { PRDContent, PRDStatus } from '@/types';
 
 export async function GET() {
@@ -51,8 +52,13 @@ export async function POST(req: NextRequest) {
   const user = await getAuthUser();
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   try {
-    const body = await req.json();
-    const { title, description, content, markdown_content, model_used, idea, structure } = body ?? {};
+    // Validate at the edge: an oversized or malformed payload used to reach
+    // Prisma directly and surface as a 500 with no indication of the field.
+    const parsed = await parseBody(req, prdSaveSchema);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.data;
+
+    const { title, description, content, markdown_content, model_used, idea, structure } = body;
 
     // Status is DERIVED, never taken from the request. A client-supplied
     // 'completed' on a payload holding one section is how a half-finished PRD
@@ -72,7 +78,12 @@ export async function POST(req: NextRequest) {
         markdownContent: markdown_content ?? null,
         modelUsed: model_used ?? null,
         idea: idea ?? null,
-        structure: structure ?? null,
+        // Same sentinel rule as `content`: Prisma distinguishes a JSON null
+        // from SQL NULL, and passing a bare `null` is a type error.
+        structure:
+          structure === undefined || structure === null
+            ? Prisma.DbNull
+            : (structure as Prisma.InputJsonValue),
       },
     });
 

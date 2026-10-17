@@ -8,6 +8,7 @@ import type { StreamChunk } from '@/lib/ai/providers';
 import type { PRDSectionKey } from '@/types';
 import { getFewShotExamples } from '@/lib/ai/prompts';
 import { buildEngineCandidates, type ResolvedEngineCandidate } from '@/lib/ai/engine-candidates';
+import { parseBody, refineSchema } from '@/lib/validation/schemas';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -63,8 +64,11 @@ export async function POST(req: Request) {
   if (!user) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
 
   const encoder = new TextEncoder();
-  const body = (await req.json().catch(() => ({}))) as Partial<RefineRequest>;
-
+  // Validate rather than blindly casting: a non-string `instruction` used to
+  // reach the prompt builder and fail there, far from the actual cause.
+  const parsed = await parseBody(req, refineSchema);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.data as Partial<RefineRequest>;
   const { model_id, section_key, content, instruction, selection, mode, engine_id, base_url, api_key, compat } = body;
   const isAsk = mode === 'ask';
   // Custom engine (saved → server-side key resolution; ad-hoc → SSRF guard)

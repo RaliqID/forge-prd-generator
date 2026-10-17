@@ -1,6 +1,7 @@
 'use client';
 
 import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import type { PRD, PRDContent, PRDSectionKey, PRDStatus, PRDFormInput, PlanStructure, PlanStep } from '@/types';
 
 export interface PendingEngineConfig {
@@ -59,7 +60,8 @@ interface PRDState {
   updateStatus: (status: PRDStatus) => void;
 }
 
-export const usePRDStore = create<PRDState>((set, get) => ({
+export const usePRDStore = create<PRDState>()(
+  persist((set, get) => ({
   pendingInput: null,
   pendingModel: null,
   pendingEngine: null,
@@ -150,4 +152,33 @@ export const usePRDStore = create<PRDState>((set, get) => ({
       set({ currentPRD: { ...currentPRD, status } });
     }
   },
-}));
+}),
+  {
+    name: 'forge-workspace',
+    // sessionStorage, not localStorage: a half-finished plan belongs to this
+    // tab's session, and a new tab should start clean.
+    storage: createJSONStorage(() => sessionStorage),
+    // Persist ONLY what must survive a reload of the workspace page.
+    //
+    // The bug this fixes: `pendingIdea` lived in memory only, so reloading
+    // /workspace/<id>?generate=true — which the browser does on refresh, and
+    // which happens automatically if the tab is restored — found an empty
+    // store and showed "Ide tidak ditemukan" with no way forward, even though
+    // the idea had already been sent to the server.
+    //
+    // Streaming/UI state is deliberately excluded: it is per-render and would
+    // resurrect stale spinners.
+    partialize: (state) => ({
+      pendingIdea: state.pendingIdea,
+      pendingModel: state.pendingModel,
+      pendingEngine: state.pendingEngine,
+      pendingSkills: state.pendingSkills,
+      pendingAutoSkills: state.pendingAutoSkills,
+      structure: state.structure,
+      activeStep: state.activeStep,
+    }),
+    // Bump when the persisted shape changes, so stale payloads are discarded
+    // instead of hydrating a mismatched object.
+    version: 1,
+  })
+);
