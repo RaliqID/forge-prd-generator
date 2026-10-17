@@ -167,6 +167,13 @@ export function buildSystemPrompt(
   examples?: FewShotExample[],
   sections?: PRDSectionKey[],
   previous?: Partial<Record<PRDSectionKey, string>>,
+  /**
+   * Optional engineering-skills guidance (see lib/skills/loader). Appended after
+   * the quality contract so it refines HOW the section is written without
+   * overriding the structural rules (heading format, section list) — those must
+   * stay authoritative or the parser cannot find the sections.
+   */
+  skillsBlock?: string,
 ): string {
   const fewShotSection = examples && examples.length > 0
     ? `\n\nFew-Shot Examples (high-quality PRD structure):\n${examples
@@ -272,7 +279,7 @@ ${sectionsBlock}${fewShotSection}
 6. SCOPE. Output HANYA section yang diminta untuk request ini, berurutan sesuai daftar, dimulai LANGSUNG dengan heading section pertama (## …). Jangan output section lain.
 7. FEW-SHOT. Bila Few-Shot Examples disediakan: tiru KEDALAMAN dan rigor-nya (specificity, struktur, keputusan yang grounded), BUKAN konten/bahasanya — jangan menyalin domain atau kalimat dari example.
 8. BE SPECIFIC & MEASURABLE. Every claim defensible; every requirement/metric quantified — "return results within 200ms for a 10k-record dataset", never "fast"/"intuitive". Vague adjectives are defects. For any AI-powered feature, define how output quality is measured (benchmark set, pass rate, eval cadence) — in Goals & Success Metrics or Functional Requirements.
-9. TAILOR & GROUND. Tailor content to THIS product, platform, and tech stack — no filler that could apply to any app. Label assumptions "(asumsi)" and estimates "(indikatif)"; push real unknowns to Open Questions instead of inventing facts. Do NOT leave any section empty or with placeholder text. No closing remarks.${previousSection}`;
+9. TAILOR & GROUND. Tailor content to THIS product, platform, and tech stack — no filler that could apply to any app. Label assumptions "(asumsi)" and estimates "(indikatif)"; push real unknowns to Open Questions instead of inventing facts. Do NOT leave any section empty or with placeholder text. No closing remarks.${previousSection}${skillsBlock ? `\n\n${skillsBlock}` : ''}`;
 }
 
 export function buildUserPrompt(input: PRDFormInput): string {

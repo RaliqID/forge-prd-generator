@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { usePRDStore } from '@/stores/prd-store';
+import { SkillPicker } from '@/components/workspace/SkillPicker';
 import { cn } from '@/lib/utils';
 import { IDEA_MAX_CHARS } from '@/lib/validation/limits';
 
@@ -82,6 +83,11 @@ export default function NewPlanPage() {
 
   const [idea, setIdea] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // Engineering-skill ids applied to this run (empty = generic PRD).
+  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  // Auto mode: let the server pick skills from the idea (default on, because
+  // the user should not have to know which of hundreds of skills apply).
+  const [autoSkills, setAutoSkills] = useState(true);
 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -252,11 +258,11 @@ export default function NewPlanPage() {
     // Built-in card = no saved engine row — server resolves 9router-auto from env.
     setPendingIdea(fullIdea, engine.name, {
       engineId: engine.builtin ? undefined : engine.id,
-    });
+    }, selectedSkills, autoSkills);
 
     const workspaceId = `plan-${Date.now()}`;
     router.push(`/workspace/${workspaceId}?generate=true&model=${encodeURIComponent(modelId)}`);
-  }, [idea, attachments, selectedModel, customEngines, router, setPendingIdea]);
+  }, [idea, attachments, selectedModel, customEngines, router, setPendingIdea, selectedSkills, autoSkills]);
 
   function resetEngineForm() {
     setEngineDialogOpen(false);
@@ -575,6 +581,17 @@ export default function NewPlanPage() {
                 Ide melebihi batas — ringkas atau pecah menjadi beberapa perencanaan.
               </p>
             )}
+          </section>
+
+          {/* Engineering skills — optional guidance that shapes the PRD */}
+          <section className="perf-ticket stagger-reveal stagger-3 p-6 pl-8">
+            <SkillPicker
+              selected={selectedSkills}
+              onChange={setSelectedSkills}
+              idea={idea}
+              auto={autoSkills}
+              onAutoChange={setAutoSkills}
+            />
           </section>
 
           {/* AI Engine selector */}

@@ -19,7 +19,11 @@ interface PRDState {
   // Workspace flow (Struktur → PRD → Task): the idea + resolved model/engine
   // set by the idea-first /new page, consumed by the workspace page.
   pendingIdea: string | null;
-  setPendingIdea: (idea: string, model: string, engine?: PendingEngineConfig) => void;
+  /** Engineering-skill ids to apply to this run (empty = none). */
+  pendingSkills: string[];
+  /** When true the server picks skills for the idea instead of `pendingSkills`. */
+  pendingAutoSkills: boolean;
+  setPendingIdea: (idea: string, model: string, engine?: PendingEngineConfig, skills?: string[], autoSkills?: boolean) => void;
   clearPendingIdea: () => void;
 
   // Persisted workspace structure across the three phases.
@@ -63,8 +67,17 @@ export const usePRDStore = create<PRDState>((set, get) => ({
   clearPendingGeneration: () => set({ pendingInput: null, pendingModel: null, pendingEngine: null }),
 
   pendingIdea: null,
-  setPendingIdea: (idea, model, engine) => set({ pendingIdea: idea, pendingModel: model, pendingEngine: engine ?? null }),
-  clearPendingIdea: () => set({ pendingIdea: null }),
+  pendingSkills: [],
+  pendingAutoSkills: false,
+  setPendingIdea: (idea, model, engine, skills, autoSkills) =>
+    set({
+      pendingIdea: idea,
+      pendingModel: model,
+      pendingEngine: engine ?? null,
+      pendingSkills: skills ?? [],
+      pendingAutoSkills: autoSkills ?? false,
+    }),
+  clearPendingIdea: () => set({ pendingIdea: null, pendingSkills: [], pendingAutoSkills: false }),
 
   structure: null,
   setStructure: (structure) => set({ structure }),

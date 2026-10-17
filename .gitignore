@@ -9,3 +9,6 @@ node_modules/
 logs/
 coverage/
 *.tsbuildinfo
+
+# tesseract.js language data downloaded at runtime — not source
+*.traineddata

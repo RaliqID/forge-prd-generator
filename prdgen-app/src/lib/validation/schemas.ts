@@ -136,6 +136,17 @@ export const prdGenerateSchema = engineRequestSchema.extend({
   previous: z.record(z.string(), z.string().max(SECTION_CONTENT_MAX_CHARS)).optional(),
   /** Existing PRD to append to / revise. */
   prd_id: z.string().max(ID_MAX_CHARS).optional(),
+  /**
+   * Engineering-skill ids to apply (see lib/skills/loader). Bounded because each
+   * skill adds prompt text to every section request.
+   */
+  skills: z.array(z.string().max(ID_MAX_CHARS)).max(8).optional(),
+  /**
+   * When true (and `skills` is empty) the server picks skills for the idea
+   * automatically. Explicit `skills` always win, so a user's manual choice is
+   * never overridden.
+   */
+  auto_skills: z.boolean().optional(),
 });
 
 // ── Plan phases ──

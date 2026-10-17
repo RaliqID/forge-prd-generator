@@ -125,6 +125,13 @@ export default function WorkspacePage() {
   // A ref so the long-running generatePRD loop and persist() always see the
   // freshest value regardless of render closures.
   const serverPrdIdRef = useRef<string | null>(null);
+  // Engineering-skill ids chosen on /new. Captured once into a ref because the
+  // generation loop runs long after the store entry is cleared, and every
+  // section request must carry the same selection.
+  const skillsRef = useRef<string[]>([]);
+  // True when the server should choose skills from the idea instead of the
+  // explicit selection above.
+  const autoSkillsRef = useRef(false);
   // Server-reported list of sections still empty after the last request. The
   // source of truth for "what's left" — more reliable than diffing the group we
   // asked for, since the model may deliver more or fewer than requested.
@@ -327,6 +334,9 @@ export default function WorkspacePage() {
       toast.add({ title: 'Ide tidak ditemukan', description: 'Mulai lagi dari halaman baru.', type: 'error' });
       return;
     }
+    // Snapshot the skill selection before the store entry is cleared.
+    skillsRef.current = usePRDStore.getState().pendingSkills ?? [];
+    autoSkillsRef.current = usePRDStore.getState().pendingAutoSkills ?? false;
     // Defer the mirror-set out of the effect body: the effect itself performs
     // no synchronous setState (cascading-render rule); generation already
     // receives the value directly.
@@ -473,6 +483,10 @@ export default function WorkspacePage() {
             previous: prevSnapshot,
             // Attach to the same server-side row across all section groups.
             prd_id: serverPrdIdRef.current ?? undefined,
+            // Applied to every section so the whole document shares one standard.
+            ...(skillsRef.current.length > 0 ? { skills: skillsRef.current } : {}),
+            // Auto mode: the server picks skills matching the idea.
+            ...(autoSkillsRef.current ? { auto_skills: true } : {}),
             ...(engineRef ?? {}),
           }),
           signal: ctrl.signal,

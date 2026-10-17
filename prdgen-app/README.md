@@ -137,6 +137,49 @@ menuruti daftar section, group besar aman dan total request turun drastis:
 | Waktu | 20+ menit (tidak selesai) | **~4 menit** |
 | Request | 14+ | **4** |
 
+## Engineering Skills
+
+PRD bisa ditulis mengikuti **standar engineering** dari skills yang terpasang di
+mesin Anda (`~/.config/opencode/skills`), bukan sekadar template generik.
+
+**Kenapa dibaca saat runtime, bukan di-copy ke repo:** sebagian skill membawa
+notice "all rights reserved / do NOT redistribute". Menyalinnya ke repository
+berarti mendistribusikan ulang — bukan hak kita. Dibaca saat runtime, panduan itu
+tetap terpakai di mesin Anda tanpa menaruh konten orang lain ke dalam project.
+
+**Dua mode** (di halaman `/new`):
+
+| Mode | Perilaku |
+|------|----------|
+| **Otomatis** (default) | Server memilih skill yang cocok dengan ide Anda. Kalau tidak ada yang cocok, dipakai baseline netral (`requirements-engineering`, `feature-planning`) supaya PRD tetap terpandu. |
+| **Pilih manual** | Anda pilih sendiri (maks 8). Pilihan manual selalu menang. |
+
+**Cara pemilihan otomatis** (`src/lib/skills/select.ts`):
+
+- Skor TF-IDF terhadap **id + deskripsi** tiap skill — jadi berlaku untuk
+  seluruh katalog, bukan daftar rule tetap. Skill baru otomatis ikut.
+- **Multibahasa**: ide Bahasa Indonesia diperluas ke istilah Inggris
+  (`pembayaran` → `payment`/`billing`/`checkout`) karena skill ditulis Inggris.
+- **Stemming** ringan: `invoice` cocok dengan `invoices`.
+- **Domain gate**: `blender-animation` tidak akan terpilih untuk "editor
+  kolaborasi" hanya karena kata "editor".
+- **Tooling dikecualikan** dari auto-pick (`antislop`, `oh-my-opencode-*`,
+  `stitch-*`, `ios-*`) — itu cara memakai tool, bukan cara merancang produk.
+  Tetap bisa dipilih manual.
+- **Ambang absolut + relatif**: kalau tidak ada yang benar-benar relevan,
+  hasilnya kosong (lalu baseline), bukan tebakan percaya diri.
+
+Skill yang dipakai dicatat di log (`skills applied`, dengan `mode` dan daftar
+id) supaya hasil PRD bisa ditelusuri asalnya.
+
+**Konfigurasi**
+
+| Variabel | Fungsi |
+|----------|--------|
+| `SKILLS_DIR` | Lokasi katalog skill. Default: `~/.config/opencode/skills`, lalu `~/.opencode/skills`, `~/.claude/skills`. Kalau di-set, **hanya** direktori itu yang dipakai. |
+
+Tanpa direktori skill, picker tidak muncul dan generasi berjalan seperti biasa.
+
 ## Environment Variables
 
 <details>

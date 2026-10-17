@@ -13,6 +13,8 @@ import { getAuthUser } from '@/lib/auth/get-auth-user';
 import { isUuid } from '@/lib/is-uuid';
 import { buildHeadingIndex, matchHeading, headingTextOf } from '@/lib/ai/heading-matcher';
 import { deriveStatus } from '@/lib/prd/status';
+import { loadSkills, buildSkillsPromptBlock, listSkills } from '@/lib/skills/loader';
+import { selectSkillsForIdea, baselineSkills } from '@/lib/skills/select';
 import { parseBody, prdGenerateSchema } from '@/lib/validation/schemas';
 import { requestLogger } from '@/lib/logger';
 import type { Prisma } from '@prisma/client';
@@ -87,6 +89,38 @@ export async function POST(req: Request) {
   const candidates = resolved.candidates.map((c) =>
     c.provider.id === '9router' ? { ...c, modelString: resolveWritingModel() } : c
   );
+
+  // ── Engineering skills ──
+  // Explicit selection wins. Otherwise, in auto mode, pick the skills that match
+  // this idea from the local catalogue so the PRD follows the right standards
+  // without the user having to know which of hundreds apply.
+  let skillIds: string[] = body.skills ?? [];
+  if (skillIds.length === 0 && body.auto_skills) {
+    const catalogue = await listSkills();
+    const ideaForMatching = [
+      body.idea ?? '',
+      input?.product_name ?? '',
+      input?.description ?? '',
+      input?.problem_statement ?? '',
+      input?.target_users ?? '',
+      ...(input?.features ?? []),
+    ]
+      .filter(Boolean)
+      .join(' ');
+    const picked = selectSkillsForIdea(ideaForMatching, catalogue, { limit: 4 });
+    // Nothing domain-specific matched — fall back to the always-useful set so
+    // the document still benefits rather than getting no guidance at all.
+    skillIds =
+      picked.length > 0
+        ? picked.map((p) => p.id)
+        : baselineSkills(catalogue, 2).map((p) => p.id);
+  }
+  // Recorded so a run's guidance is auditable after the fact — otherwise there
+  // is no way to tell a bad PRD apart from one written without skills.
+  log.info('skills applied', {
+    mode: body.skills?.length ? 'manual' : body.auto_skills ? 'auto' : 'none',
+    skills: skillIds,
+  });
   const useRealAI = Boolean(candidates.length > 0 && (input || structure));
   // The user asked for a real generation but no provider/key is configured.
   // Falling through to mock content here is indistinguishable from success in
@@ -215,7 +249,7 @@ export async function POST(req: Request) {
 
       try {
         if (useRealAI) {
-          await streamRealAI(controller, encoder, candidates, { input, structure, idea }, prdId, sections, previous, req.signal, user.id, contentAcc, persistContent);
+          await streamRealAI(controller, encoder, candidates, { input, structure, idea }, prdId, sections, previous, req.signal, user.id, contentAcc, persistContent, skillIds);
         } else if (noProviderConfigured) {
           controller.enqueue(
             encoder.encode(
@@ -286,13 +320,19 @@ async function streamRealAI(
   previous: Partial<Record<PRDSectionKey, string>>,
   clientSignal?: AbortSignal,
   userId?: string,
-  contentAcc?: Partial<Record<PRDSectionKey, string>>,
-  persistContent?: (status: PRDStatus) => Promise<void>,
-) {
-  // Self-improvement: inject excerpts from the user's OWN completed PRDs as
-  // few-shot examples (owner-scoped — never other users' content).
-  const fewShotExamples = await getFewShotExamples(userId ?? null, 2);
-  const systemPrompt = buildSystemPrompt(fewShotExamples, sections, previous);
+    contentAcc?: Partial<Record<PRDSectionKey, string>>,
+    persistContent?: (status: PRDStatus) => Promise<void>,
+    /** Engineering-skill ids applied to this generation. */
+    skills?: string[],
+  ) {
+    // Self-improvement: inject excerpts from the user's OWN completed PRDs as
+    // few-shot examples (owner-scoped — never other users' content).
+    const fewShotExamples = await getFewShotExamples(userId ?? null, 2);
+    // Engineering skills chosen by the user refine HOW the sections are written.
+    // Loaded server-side from the local skills directory; an unknown id is
+    // simply skipped, so a stale selection can never break generation.
+    const skillsBlock = skills?.length ? buildSkillsPromptBlock(await loadSkills(skills)) : '';
+    const systemPrompt = buildSystemPrompt(fewShotExamples, sections, previous, skillsBlock);
   const userPrompt = source.structure
     ? buildUserPromptFromStructure(source.idea ?? '', source.structure)
     : buildUserPrompt(source.input!);
